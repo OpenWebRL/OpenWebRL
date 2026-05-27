@@ -7,11 +7,13 @@
 
 <sup>1</sup> University of Illinois Urbana-Champaign, <sup>2</sup> Microsoft Research
 
-</div>
+
 
 *Equal contribution. † Project lead 
 
 Links: [Paper](#) | [Hugging Face](https://huggingface.co/OpenWebRL)
+
+</div>
 
 OpenWebRL is a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL.
 
