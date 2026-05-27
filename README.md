@@ -1,6 +1,6 @@
-# OpenWebRL: Online Multi-Turn Reinforcement Learning for Visual Web Agents
-
 <div align="center">
+
+# OpenWebRL: Online Multi-Turn Reinforcement Learning for Visual Web Agents
 
 [Rui Yang](https://yangrui2015.github.io/)<sup>1*†</sup>, [Qianhui Wu](https://qianhuiwu.github.io/)<sup>2*†</sup>, [Yuxi Chen](https://www.linkedin.com/in/yuxichen6/)<sup>1</sup>, [Hao Bai](https://biechi.github.io/)<sup>1</sup>, [Wenlin Yao](https://wenlinyao.github.io)<sup>2</sup>, [Hao Cheng](https://sites.google.com/site/hcheng2site/Home)<sup>2</sup>,<br>
 [Baolin Peng](https://www.microsoft.com/en-us/research/people/baolinpeng/)<sup>2</sup>, [Huan Zhang](https://huan-zhang.com)<sup>1</sup>, [Tong Zhang](https://tongzhang-ml.org)<sup>1</sup>, [Jianfeng Gao](https://www.microsoft.com/en-us/research/people/jfgao/)<sup>2</sup>
@@ -241,36 +241,13 @@ TASK_FILE=openwebrl/data/online-mind2web.jsonl \
 bash scripts/run_evaluation_local.sh
 ```
 
-<<<<<<< HEAD
-## Development And Verification
-
-Useful checks before opening a release PR:
-
-```bash
-python -m py_compile openwebrl/generate_browser.py
-python -m py_compile openwebrl/reward_browser.py
-python -m py_compile openwebrl/data/convert_benchmark_jsonl_to_parquet.py
-python -m py_compile tools/convert_torch_dist_to_hf_bridge.py
-```
-
-Check for accidental local paths or credentials:
-
-```bash
-rg -n "(/data/users/|/Users/|/mnt/data|10\\.|/tmp/aoai_token|OPENAI_API_KEY|WANDB_API_KEY|SANDBOX_API_KEY)" .
-```
-
-=======
->>>>>>> Initial OpenWebRL release
 ## Acknowledgements
 
 This repository builds on [slime](https://github.com/THUDM/slime),
 [SGLang](https://github.com/sgl-project/sglang), Megatron-LM,
 Megatron-Bridge, Playwright, and the open-source VLM/web-agent ecosystem.
-<<<<<<< HEAD
-=======
 We also thank Qwen for releasing the base VLMs used in our experiments, and
 WebGym for providing the initial browser-task data source.
->>>>>>> Initial OpenWebRL release
 
 ## Citation
 
