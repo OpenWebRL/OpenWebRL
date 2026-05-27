@@ -1,0 +1,78 @@
+# ==========================================================================
+# Browser Environment Server Docker Image
+#
+# Serves N browser environments via HTTP for slime training/rollout.
+#
+# Build (from repo root):
+#   docker build -f openwebrl/docker/Dockerfile.browser -t browser-env .
+#
+# Run:
+#   docker run -p 8100:8100 -e NUM_BROWSER_ENVS=4 --shm-size=2g browser-env
+# ==========================================================================
+
+FROM python:3.10-slim
+
+# ---- System dependencies for Playwright / Chromium ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        curl \
+        gnupg \
+        ca-certificates \
+        fonts-liberation \
+        libnss3 \
+        libatk-bridge2.0-0 \
+        libdrm2 \
+        libxkbcommon0 \
+        libgbm1 \
+        libasound2 \
+        libxshmfence1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ---- Python dependencies ----
+# NOTE: qwen_vl_utils is NOT installed here because it pulls in torch (~2GB).
+# The smart_resize import is lazy and only triggered when resize_scale <= 0,
+# which the default config does not use.
+RUN pip install --no-cache-dir \
+        fastapi \
+        uvicorn[standard] \
+        pyyaml \
+        playwright \
+        timeout-decorator
+
+# Install Chromium for Playwright
+RUN playwright install --with-deps chromium
+
+# ---- Copy only the browser env code (no slime / torch dependency) ----
+
+# Package structure so "from openwebrl.env.web_env import WebEnv" works
+RUN mkdir -p /app/openwebrl/env/utils /app/openwebrl/docker
+
+# __init__.py files (empty stubs – the server doesn't need the full package)
+RUN touch /app/openwebrl/__init__.py \
+          /app/openwebrl/docker/__init__.py \
+          /app/openwebrl/env/__init__.py \
+          /app/openwebrl/env/utils/__init__.py
+
+# Core env files
+COPY openwebrl/env/base_env.py       /app/openwebrl/env/base_env.py
+COPY openwebrl/env/web_env.py        /app/openwebrl/env/web_env.py
+COPY openwebrl/env/utils/js.py       /app/openwebrl/env/utils/js.py
+COPY openwebrl/env/utils/keyboard.py /app/openwebrl/env/utils/keyboard.py
+
+# Config and prompts
+# COPY openwebrl/env/config.yaml       /app/openwebrl/env/config.yaml
+# COPY openwebrl/env/prompts/          /app/openwebrl/env/prompts/
+
+# Server entry point
+COPY openwebrl/docker/env_server.py         /app/openwebrl/docker/env_server.py
+
+# ---- Runtime config ----
+ENV PYTHONPATH=/app
+ENV NUM_BROWSER_ENVS=1
+
+EXPOSE 8100
+
+# Run the server
+CMD ["python", "-m", "openwebrl.docker.env_server", "--host", "0.0.0.0", "--port", "8100"]

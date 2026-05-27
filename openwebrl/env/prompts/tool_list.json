@@ -1,0 +1,301 @@
+[
+    {
+        "type": "function",
+        "function": {
+            "name": "click",
+            "description": "Performs a mouse click at specific screen coordinates.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "point_2d": {
+                        "type": "array",
+                        "items": {
+                            "type": "number"
+                        },
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "The [x, y] pixel coordinates relative to the viewport's top-left corner."
+                    },
+                    "clicks": {
+                        "type": "integer",
+                        "description": "The number of consecutive clicks to perform (e.g., 1 for a single click, 2 for a double click).",
+                        "default": 1
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": [
+                            "left",
+                            "right",
+                            "middle"
+                        ],
+                        "description": "The mouse button to trigger.",
+                        "default": "left"
+                    }
+                },
+                "required": [
+                    "point_2d"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Type text using the keyboard. This will first clear any existing content in the focused input field (using Ctrl+A and Backspace), then type the new text. Make sure to click on an input field before using this action.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The text content to type into the focused input field"
+                    }
+                },
+                "required": [
+                    "message"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "press_keys",
+            "description": "Press specific keys or key combinations on the keyboard. Use this for navigation, shortcuts, or discrete key presses.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keys": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "The list of specific keys to press. \nACCEPTED KEYS:\n- Modifiers: \"Alt\", \"Control\", \"Meta\", \"Shift\"\n- Actions: \"Enter\", \"Tab\", \"Space\", \"Backspace\", \"Delete\", \"Escape\"\n- Navigation: \"ArrowUp\", \"ArrowDown\", \"ArrowLeft\", \"ArrowRight\", \"Home\", \"End\", \"PageUp\", \"PageDown\"\n- Standard: \"a\"-\"z\", \"0\"-\"9\", \"F1\"-\"F12\""
+                    },
+                    "is_hotkey": {
+                        "type": "boolean",
+                        "description": "If true, all keys in the list are pressed simultaneously (e.g., [\"Control\", \"c\"]). If false, keys are pressed one by one in sequence.",
+                        "default": false
+                    },
+                    "presses": {
+                        "type": "integer",
+                        "description": "Number of times to repeat the press action.",
+                        "default": 1
+                    }
+                },
+                "required": [
+                    "keys"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scroll",
+            "description": "Scroll the page or a specific scrollable element in the given direction. If point_2d is provided, the scroll occurs on the element at that coordinate (useful for scrollable sub-containers like sidebars, modals, or chat panels). Otherwise, scrolls the main page.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "direction": {
+                        "type": "string",
+                        "enum": [
+                            "up",
+                            "down",
+                            "left",
+                            "right"
+                        ],
+                        "description": "Direction to scroll.",
+                        "default": "down"
+                    },
+                    "amount": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Scroll amount as a percentage of the viewport height (0.0 to 1.0). For example, 0.5 means scroll by half a page.",
+                        "default": 0.5
+                    },
+                    "point_2d": {
+                        "type": "array",
+                        "items": {
+                            "type": "number"
+                        },
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "Optional [x, y] pixel coordinates of the element to scroll within. If omitted, scrolls the main page."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "wait",
+            "description": "Wait for a specified number of seconds before continuing. Use this when you need to allow time for page content to load or for animations to complete.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "integer",
+                        "description": "Number of seconds to wait (integer value)",
+                        "default": 3
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "done",
+            "description": "Signal task completion and provide the final answer. Call this function when you have successfully completed the task, when you have determined that the task cannot be completed, or when you encounter a CAPTCHA or anti-bot verification page that blocks further progress. Provide a clear and concise response summarizing what was accomplished or explaining why the task could not be completed (e.g., blocked by CAPTCHA).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "response": {
+                        "type": "string",
+                        "description": "The final answer, result, summary of the task, or reason for task failure. Be specific and include relevant details such as: the information found, actions completed, or reason for task failure."
+                    }
+                },
+                "required": [
+                    "response"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "goto_url",
+            "description": "Navigate the current open tab to a specific URL. Use this to open a new webpage directly in the current tab instead of clicking through links or typing in the address bar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL to navigate to (e.g., \"https://www.example.com\")."
+                    }
+                },
+                "required": [
+                    "url"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "go_back",
+            "description": "Navigate back to the previous page in the browser history. Equivalent to clicking the browser's back button.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "drag",
+            "description": "Perform a drag-and-drop operation from a starting screen coordinate to an ending coordinate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_point_2d": {
+                        "type": "array",
+                        "items": {
+                            "type": "number"
+                        },
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "The [x, y] coordinates to start dragging from."
+                    },
+                    "end_point_2d": {
+                        "type": "array",
+                        "items": {
+                            "type": "number"
+                        },
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "The [x, y] coordinates to drop at."
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "description": "The number of intermediate mouse steps to take. Higher values make the drag slower and more human-like. Use 10-20 for standard drags.",
+                        "default": 10
+                    }
+                },
+                "required": [
+                    "start_point_2d",
+                    "end_point_2d"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hover",
+            "description": "Move the mouse cursor to a specific coordinate. Use this to trigger hover states, reveal tooltips, or open dropdown menus.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "point_2d": {
+                        "type": "array",
+                        "items": {
+                            "type": "integer"
+                        },
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "The [x, y] pixel coordinates to move the cursor to."
+                    }
+                },
+                "required": [
+                    "point_2d"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "new_tab",
+            "description": "Open a new blank browser tab. Use goto_url after switching to the new tab to navigate to a specific URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "switch_tab",
+            "description": "Switch to a different browser tab by its index (0-based). Use this to navigate between multiple open tabs.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tab_index": {
+                        "type": "integer",
+                        "description": "The 0-based index of the tab to switch to."
+                    }
+                },
+                "required": [
+                    "tab_index"
+                ]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "close_tab",
+            "description": "Close the current browser tab. If there are multiple tabs open, the browser will switch to the nearest remaining tab.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }
+]

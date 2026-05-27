@@ -1,0 +1,261 @@
+# OpenWebRL: Online Multi-Turn Reinforcement Learning for Visual Web Agents
+
+unofficial code release for OpenWebRL, a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL.
+
+The main browser-agent implementation lives in [`openwebrl/`](openwebrl/).
+It supports Playwright-based browser interaction, multi-turn multimodal
+rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge rewards, and training/evaluation scripts for Qwen3-VL style visual language models.
+
+## Method At A Glance
+
+| Stage | What it does | Main entry point |
+|---|---|---|
+| Data preparation | Uses curated browser tasks in parquet / JSONL format and can convert benchmark JSONL files to the training parquet schema. | [`openwebrl/data/`](openwebrl/data/) |
+| Browser rollout | Runs multi-turn browser episodes with screenshots, tool calls, environment feedback, and response-format checks. | [`openwebrl/generate_browser.py`](openwebrl/generate_browser.py) |
+| Online RL training | Trains a visual web agent with turn-level or trajectory-level browser rollouts and judge-based rewards. See [Training Scripts](#training-scripts) for available launchers. | [`scripts/run_browser_Qwen3VL_4B_Instruct.sh`](scripts/run_browser_Qwen3VL_4B_Instruct.sh) |
+| Reward / judge | Combines format rewards with VLM-as-a-judge success evaluation through OpenAI-compatible, Azure, or self-hosted endpoints. | [`openwebrl/reward_browser.py`](openwebrl/reward_browser.py) |
+| Evaluation | Evaluates converted Hugging Face checkpoints on browser benchmark task files. | [`scripts/run_evaluation.sh`](scripts/run_evaluation.sh), [`openwebrl/run_evaluate.py`](openwebrl/run_evaluate.py) |
+| Optional judge SFT | Contains utilities for training and evaluating a smaller browser judge model. | [`openwebrl/judge/`](openwebrl/judge/) |
+
+## Repository Layout
+
+```text
+.
+├── README.md
+├── requirements.txt
+├── set_up.sh
+├── setup.py / pyproject.toml
+├── train.py
+├── slime/                         # Modified RL training framework
+├── slime_plugins/                 # Remaining model/plugin extensions
+├── tools/                         # Checkpoint conversion helper used by scripts/run_convert_hf.sh
+├── docker/                        # Base training Dockerfile and patches
+├── scripts/                       # OpenWebRL training/evaluation/conversion entrypoints
+│   └── model_configs/             # Model argument presets used by conversion/training
+└── openwebrl/
+    ├── README.md                  # Detailed browser-environment notes
+    ├── generate_browser.py        # Multi-turn browser rollout driver
+    ├── reward_browser.py          # Format reward + VLM judge reward
+    ├── response_format.py         # Browser-agent response-format handling
+    ├── browser_training_config.yaml
+    ├── run_evaluate.py
+    ├── data/
+    │   ├── webgym_filtered_popular_2102_cleaned.parquet
+    │   ├── webvoyager_val.parquet
+    │   ├── online-mind2web.jsonl
+    │   └── convert_benchmark_jsonl_to_parquet.py
+    ├── docker/                    # Browser env server Dockerfile / compose / FastAPI server
+    ├── env/                       # Playwright browser env and local/sandbox clients
+    └── judge/                     # Optional judge-evaluation utilities
+```
+
+## Included Data
+
+The release includes small browser datasets under [`openwebrl/data/`](openwebrl/data/):
+
+| File | Use |
+|---|---|
+| `webgym_filtered_popular_2102_cleaned.parquet` | Default RL training prompts used by the browser training launcher. |
+| `webvoyager_val.parquet` | Default validation prompts. |
+| `online-mind2web.jsonl` | Online-Mind2Web task file for evaluation. |
+
+
+
+## Installation
+
+OpenWebRL expects Python 3.10 or newer and a CUDA-capable environment for the
+full training stack.
+
+```bash
+# 1. Install Python dependencies, CUDA/SGLang pins, and Playwright Chromium.
+bash set_up.sh
+
+# 2. Install this repository in editable mode.
+pip install -e .
+```
+
+The browser environment can run in two modes configured in
+[`openwebrl/env/config.yaml`](openwebrl/env/config.yaml):
+
+| Mode | Description |
+|---|---|
+| `local_process` | Starts local `env_server.py` subprocesses on this machine. Useful for debugging and small evaluation runs. |
+| `sandbox` | Uses a sandbox orchestrator to create isolated browser pods for large-scale parallel rollout. |
+
+For sandbox mode, build and publish the browser environment image to a registry
+your cluster can pull from:
+
+```bash
+docker build -f openwebrl/docker/Dockerfile.browser \
+  -t <your-registry>/browser-env:latest .
+
+docker push <your-registry>/browser-env:latest
+```
+
+Then set `BROWSER_SANDBOX_IMAGE`, `SANDBOX_ORCHESTRATOR_URL`, and
+`SANDBOX_API_KEY` in your environment.
+
+## Required Environment
+
+Start from the template:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+source .env
+```
+
+Core paths:
+
+| Variable | Description |
+|---|---|
+| `SLIME_REPO_ROOT` | Absolute path to this repository. |
+| `SLIME_MODEL_ROOT` | Directory containing pretrained and converted model checkpoints. |
+| `SLIME_SAVE_ROOT` | Directory where training writes checkpoints and logs. |
+| `SLIME_OUTPUT_ROOT` | Directory for evaluation outputs and debug traces. |
+| `PYTHONPATH` | Should include this repo and your Megatron-LM checkout. |
+
+Browser environment:
+
+| Variable | Description |
+|---|---|
+| `SLIME_BROWSER_ENV_MODE` | `sandbox` or `local_process`. |
+| `BROWSER_SANDBOX_IMAGE` | Browser container image for sandbox mode. |
+| `SANDBOX_ORCHESTRATOR_URL` | Sandbox orchestrator URL for sandbox mode. |
+| `SANDBOX_API_KEY` | Sandbox orchestrator API key. |
+
+Judge / reward:
+
+| Variable | Description |
+|---|---|
+| `JUDGE_API_MODE` | `token`, `api_key`, or `served`. |
+| `JUDGE_MODEL` | Judge model name, deployment name, or local/self-hosted model id. |
+| `JUDGE_API_BASE` | OpenAI-compatible endpoint for `served` or `api_key` modes. |
+| `JUDGE_API_KEY` | Judge endpoint key if needed. |
+| `OPENAI_API_KEY` | Optional OpenAI-compatible API key. |
+| `AZURE_RESOURCE_NAME` | Optional Azure resource name for token-mode judge calls. |
+| `AZURE_API_VERSION` | Optional Azure API version. |
+
+Experiment tracking:
+
+| Variable | Description |
+|---|---|
+| `WANDB_API_KEY` | Optional. If unset, W&B logging stays disabled in the launcher scripts. |
+| `WANDB_ENTITY` | Optional W&B entity/team. |
+
+## Quick Start
+
+### 1. Prepare the environment
+
+```bash
+bash set_up.sh
+pip install -e .
+cp .env.example .env
+$EDITOR .env
+source .env
+```
+
+### 2. Check browser config
+
+Edit [`openwebrl/env/config.yaml`](openwebrl/env/config.yaml):
+
+```yaml
+mode: sandbox        # or local_process
+path_to_task_file: data/online-mind2web.jsonl
+use_screenshot: true
+use_a11ytree: false
+```
+
+For quick local debugging, set:
+
+```yaml
+mode: local_process
+```
+
+### 3. Train with online browser RL
+
+#### Training Scripts
+
+| Script | Description |
+|---|---|
+| `run_browser_Qwen3VL_4B_Instruct.sh` | Main MM-GRPO training launcher for Qwen3-VL-4B. Default entry point for reproducing OpenWebRL-4B. |
+| `run_browser_Qwen3VL_8B_Instruct.sh` | MM-GRPO training launcher for Qwen3-VL-8B. |
+
+The main launcher is:
+
+```bash
+bash scripts/run_browser_Qwen3VL_4B_Instruct.sh
+```
+
+Before running, set at least:
+
+```bash
+export SLIME_MODEL_ROOT=<path-to-model-checkpoints>
+export SLIME_SAVE_ROOT=<path-for-training-outputs>
+export JUDGE_API_MODE=<token|api_key|served>
+export JUDGE_MODEL=<judge-model-or-deployment>
+```
+
+The launcher reads the included training data by default:
+
+```text
+openwebrl/data/webgym_filtered_popular_2102_cleaned.parquet
+```
+
+### 4. Evaluate a checkpoint
+
+Convert a Megatron checkpoint to Hugging Face format if needed:
+
+```bash
+bash scripts/run_convert_hf.sh <path-to-iter-dir> <origin-hf-model-dir>
+```
+
+Then run evaluation:
+
+```bash
+MODEL_PATH=<path-to-hf-checkpoint> \
+TASK_FILE=openwebrl/data/online-mind2web.jsonl \
+bash scripts/run_evaluation.sh
+```
+
+For local-process smoke tests:
+
+```bash
+MODEL_PATH=<path-to-hf-checkpoint> \
+TASK_FILE=openwebrl/data/online-mind2web.jsonl \
+bash scripts/run_evaluation_local.sh
+```
+
+## Development And Verification
+
+Useful checks before opening a release PR:
+
+```bash
+python -m py_compile openwebrl/generate_browser.py
+python -m py_compile openwebrl/reward_browser.py
+python -m py_compile openwebrl/data/convert_benchmark_jsonl_to_parquet.py
+python -m py_compile tools/convert_torch_dist_to_hf_bridge.py
+```
+
+Check for accidental local paths or credentials:
+
+```bash
+rg -n "(/data/users/|/Users/|/mnt/data|10\\.|/tmp/aoai_token|OPENAI_API_KEY|WANDB_API_KEY|SANDBOX_API_KEY)" .
+```
+
+## Acknowledgements
+
+This repository builds on [slime](https://github.com/THUDM/slime),
+[SGLang](https://github.com/sgl-project/sglang), Megatron-LM,
+Megatron-Bridge, Playwright, and the open-source VLM/web-agent ecosystem.
+
+## Citation
+
+```bibtex
+@article{yang2026openwebrl,
+  title   = {OpenWebRL: Demystifying Online Multi-turn Reinforcement Learning for Visual Web Agents},
+  author  = {Rui Yang and Qianhui Wu and Yuxi Chen and Hao Bai and Wenlin Yao and Hao Cheng and Baolin Peng and Huan Zhang and Tong Zhang and Jianfeng Gao},
+  journal = {arXiv preprint},
+  year    = {2026}
+}
+```

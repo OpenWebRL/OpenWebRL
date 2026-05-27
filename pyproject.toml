@@ -1,0 +1,36 @@
+[build-system]
+requires = [
+    "packaging",
+    "setuptools >= 49.4.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.isort]
+profile = "black"  # black-compatible
+line_length = 119  # should match black parameters
+ignore_whitespace = true  # ignore whitespace for compatibility with the initial style
+py_version = 310  # python 3.10 as a target version
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+default_section = "THIRDPARTY"
+extend_skip = ["setup.py"]
+known_first_party = ["openwebrl", "slime", "slime_plugins"]
+known_third_party = ["megatron", "wandb", "ray", "transformers"]
+src_paths = ["openwebrl", "slime", "slime_plugins"]
+
+
+[tool.black]
+line_length = 119
+
+[tool.ruff]
+line-length = 320  # TODO
+select = [
+    "E",      # Pycodestyle Errors (Structural/Fundamental Errors like bad indentation)
+    "F",      # Pyflakes (Core Errors: Unused imports, undefined names)
+    "B",      # Flake8-Bugbear (Logic Bugs: Variable shadowing, dangerous default arguments)
+    "UP",     # pyupgrade (Modernization and compatibility issues)
+]
+ignore = [
+    "E402", # module-import-not-at-top-of-file
+    "E501", # Line too long # TODO handle it later
+]

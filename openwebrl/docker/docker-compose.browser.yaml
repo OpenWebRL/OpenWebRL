@@ -1,0 +1,66 @@
+# ==========================================================================
+# Browser Environment Server – Docker Compose
+#
+# Usage (from repo root):
+#   docker compose -f openwebrl/docker/docker-compose.browser.yaml up --build
+#
+# Single server:  http://localhost:8100
+# Multiple servers: http://localhost:8100, http://localhost:8101, ...
+#
+# This compose file is intended for validating the standalone env_server
+# image/API. The main rollout launchers use SLIME_BROWSER_ENV_MODE=sandbox
+# or SLIME_BROWSER_ENV_MODE=local_process.
+# ==========================================================================
+
+# ------------------------------------------------------------------
+# Shared build/runtime config via YAML anchor
+# ------------------------------------------------------------------
+x-browser-env: &browser-env-base
+  build:
+    context: ../..               # repo root
+    dockerfile: openwebrl/docker/Dockerfile.browser
+  environment:
+    - NUM_BROWSER_ENVS=4
+    - BROWSER_ENV_IDLE_TIMEOUT_SECS=600
+  # Chromium needs shared memory > default 64MB
+  shm_size: "2g"
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+
+services:
+  # ---- First browser env server (always enabled) ----
+  browser-env-0:
+    <<: *browser-env-base
+    container_name: browser-env-0
+    ports:
+      - "8100:8100"
+
+  # ---- Additional servers: uncomment to scale out ----
+  browser-env-1:
+    <<: *browser-env-base
+    container_name: browser-env-1
+    ports:
+      - "8101:8100"
+
+  # browser-env-2:
+  #   <<: *browser-env-base
+  #   container_name: browser-env-2
+  #   ports:
+  #     - "8102:8100"
+
+  # Example placeholder: add other services here if you want to test them
+  # against the standalone browser env server on the same compose network.
+  #
+  # slime:
+  #   image: slime:latest
+  #   container_name: slime
+  #   depends_on:
+  #     browser-env-0:
+  #       condition: service_healthy
+  #     browser-env-1:
+  #       condition: service_healthy

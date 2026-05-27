@@ -1,0 +1,59 @@
+# Environment mode: "local_process" or "sandbox"
+# - local_process: create one local env_server subprocess/process group per env
+# - sandbox: create K8s sandbox pods via orchestrator + exec/curl
+mode: sandbox
+
+# Sandbox-specific config (used when mode: sandbox).
+# A fresh sandbox is created for each generation and deleted on env.exit().
+# Connection settings can be overridden by env vars (SANDBOX_ORCHESTRATOR_URL, SANDBOX_API_KEY).
+sandbox:
+  orchestrator_url: ""          # SANDBOX_ORCHESTRATOR_URL
+  api_key: ""                   # SANDBOX_API_KEY
+  image: "${BROWSER_SANDBOX_IMAGE:-browser-env:latest}"  # container image for sandbox pods
+  cpu: "1"                      # CPU request/limit per sandbox
+  memory: "4Gi"                # memory request/limit per sandbox
+  block_network: false          # block network egress in sandbox
+  max_sandboxes: 32              # max concurrently active sandboxes in one rollout process; extra requests wait in queue
+  acquire_timeout_secs: 1800    # max wait time for a sandbox slot before failing; <=0 waits forever
+  max_retries: 10               # max retry attempts for sandbox client requests
+  retry_delay: 5                # initial backoff delay in seconds (exponential: 5s, 10s, 20s, ...)
+  log_successful_requests: false # false: suppress per-request /reset,/step,/exit OK diagnostics in rollout logs
+
+# Local subprocess-specific config (used when mode: local_process).
+# A fresh local env_server subprocess is created for each generation and
+# killed as a process group on env.exit(), so Chromium children are cleaned up
+# even if Playwright/env_server shutdown hangs.
+local_process:
+  host: "127.0.0.1"
+  port_start: 18000
+  port_end: 18999
+  startup_timeout_secs: 30
+  startup_poll_secs: 0.5
+  request_timeout_secs: 300
+  exit_timeout_secs: 10
+  kill_timeout_secs: 5
+  max_processes: 16
+  acquire_timeout_secs: 600
+  log_dir: "/tmp/slime_browser_local_process_env_logs"
+  port_lock_dir: "/tmp/slime_browser_local_process_ports"
+  python_bin: ""  # empty uses the current Python executable
+
+width: 1280
+height: 1000
+dpr: 1
+
+max_retries: 3
+wait_timeout: 10000
+screenshot_timeout: 30000
+
+# related to coordinate resizing
+resize_output_coords: true # if True, then resize_scale or patch_size will be used to resize the output coordinates
+resize_scale: 1000 # if int > 0: the predicted coordinates will be divided by this factor for normalization; if 0 or negative, will check `patch_size`
+image_patch_size: 32 # qwen3vl: 32; qwen25vl: 28. if resize_scale <= 0, will call smart_resize with this patch_size to resize the output coordinates
+
+path_to_policy: env/prompts/system_prompt.md
+path_to_tool_list: env/prompts/tool_list.json
+path_to_task_file: data/online-mind2web.jsonl
+
+use_screenshot: true
+use_a11ytree: false

@@ -1,0 +1,7 @@
+screenshots/
+sandbox_manifest.json
+samples/
+!requirements.txt
+__pycache__/
+azure-modal/
+sandbox/

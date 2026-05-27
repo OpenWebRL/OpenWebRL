@@ -1,0 +1,59 @@
+# Additional training config for browser environment.
+# These values are accessible on the `args` object inside generate_browser.py
+# and reward_browser.py via getattr(args, ...).
+
+# Maximum total tokens (prompt + response) per trajectory before truncating.
+# Browser trajectories can be long - set this to your GPU memory budget.
+rollout_max_context_len: 32768
+
+# abort if model fails to produce valid tool calls N times in a row
+max_consecutive_parse_failures: 3
+
+# max steps per episode (trajectory). Note: an episode can end early due to success/failure conditions, but will be truncated if it exceeds this limit.
+max_steps: 16
+
+# Number of latest screenshots to include in the turn-level context.
+# Only used by generate_turn_sample. K=1 keeps only the current screenshot;
+# K>1 keeps the last K screenshots (prior + current) in each turn's input.
+# Set via CLI: --context-num-screenshots
+
+# save the generated samples. Empty string to disable saving.
+path_to_save_generated_samples: ""
+
+# Probability of saving rollout and judge debug traces under the training
+# save/checkpoint directory. 0 disables saving; 0.1 saves about 10%.
+debug_trace_prob: 0.005
+
+# Timeout controls for browser rollout during training.
+inference_step_timeout_secs: 30.0
+rollout_task_timeout_secs: 600.0
+
+# Limit the number of browser tasks that may enter generation concurrently in
+# one rollout worker process. Set <=0 to disable the explicit config gate so
+# generate_browser falls back to SLIME_BROWSER_ROLLOUT_CONCURRENCY, then
+# SLIME_BROWSER_SANDBOX_MAX_SANDBOXES.
+browser_rollout_concurrency: 0
+
+# Whether to include environment feedback as <tool_response>...</tool_response>
+# in the next rollout input. 1 keeps current behavior; 0 sends only observation.
+# Set via CLI: --browser-include-tool-response
+browser_include_tool_response: 1
+
+# Logging controls. Keep raw LLM/judge output off by default to avoid noisy Ray logs.
+log_task_start: true
+log_llm_output: false
+log_llm_output_prob: 0.1
+log_judge_output: false
+log_judge_output_prob: 0.1
+
+# Custom eval logging: also log format_reward and judge_reward as separate wandb charts.
+# custom_eval_rollout_log_function_path: openwebrl.eval_log_browser.eval_log_func
+
+# Set via CLI:
+# - --judge-max-attached-imgs
+# - --judge-timeout-secs
+# - --judge-api-model
+# - --judge-prompt-variant
+# - --turn-history-reasoning-mode
+# judge_max_tokens: 2048
+# judge_temperature: 0.0
