@@ -1,6 +1,15 @@
 # OpenWebRL: Online Multi-Turn Reinforcement Learning for Visual Web Agents
 
-unofficial code release for OpenWebRL, a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL.
+[Rui Yang](https://yangrui2015.github.io/)<sup>1*†</sup>, [Qianhui Wu](https://qianhuiwu.github.io/)<sup>2*†</sup>, [Yuxi Chen](https://www.linkedin.com/in/yuxichen6/)<sup>1</sup>, [Hao Bai](https://biechi.github.io/)<sup>1</sup>, [Wenlin Yao](https://wenlinyao.github.io)<sup>2</sup>, [Hao Cheng](https://sites.google.com/site/hcheng2site/Home)<sup>2</sup>, [Baolin Peng](https://www.microsoft.com/en-us/research/people/baolinpeng/)<sup>2</sup>, [Huan Zhang](https://huan-zhang.com)<sup>1</sup>, [Tong Zhang](https://tongzhang-ml.org)<sup>1</sup>, [Jianfeng Gao](https://www.microsoft.com/en-us/research/people/jfgao/)<sup>2</sup>
+
+<sup>1</sup> University of Illinois Urbana-Champaign  
+<sup>2</sup> Microsoft Research
+
+*Equal contribution. † Project lead 
+
+Links: [Code](https://github.com/OpenWebRL/OpenWebRL) | [Hugging Face](https://huggingface.co/OpenWebRL)
+
+OpenWebRL is a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL.
 
 The main browser-agent implementation lives in [`openwebrl/`](openwebrl/).
 It supports Playwright-based browser interaction, multi-turn multimodal
@@ -226,6 +235,7 @@ TASK_FILE=openwebrl/data/online-mind2web.jsonl \
 bash scripts/run_evaluation_local.sh
 ```
 
+<<<<<<< HEAD
 ## Development And Verification
 
 Useful checks before opening a release PR:
@@ -243,11 +253,18 @@ Check for accidental local paths or credentials:
 rg -n "(/data/users/|/Users/|/mnt/data|10\\.|/tmp/aoai_token|OPENAI_API_KEY|WANDB_API_KEY|SANDBOX_API_KEY)" .
 ```
 
+=======
+>>>>>>> Initial OpenWebRL release
 ## Acknowledgements
 
 This repository builds on [slime](https://github.com/THUDM/slime),
 [SGLang](https://github.com/sgl-project/sglang), Megatron-LM,
 Megatron-Bridge, Playwright, and the open-source VLM/web-agent ecosystem.
+<<<<<<< HEAD
+=======
+We also thank Qwen for releasing the base VLMs used in our experiments, and
+WebGym for providing the initial browser-task data source.
+>>>>>>> Initial OpenWebRL release
 
 ## Citation
 
