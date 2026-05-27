@@ -1,13 +1,17 @@
 # OpenWebRL: Online Multi-Turn Reinforcement Learning for Visual Web Agents
 
-[Rui Yang](https://yangrui2015.github.io/)<sup>1*†</sup>, [Qianhui Wu](https://qianhuiwu.github.io/)<sup>2*†</sup>, [Yuxi Chen](https://www.linkedin.com/in/yuxichen6/)<sup>1</sup>, [Hao Bai](https://biechi.github.io/)<sup>1</sup>, [Wenlin Yao](https://wenlinyao.github.io)<sup>2</sup>, [Hao Cheng](https://sites.google.com/site/hcheng2site/Home)<sup>2</sup>, [Baolin Peng](https://www.microsoft.com/en-us/research/people/baolinpeng/)<sup>2</sup>, [Huan Zhang](https://huan-zhang.com)<sup>1</sup>, [Tong Zhang](https://tongzhang-ml.org)<sup>1</sup>, [Jianfeng Gao](https://www.microsoft.com/en-us/research/people/jfgao/)<sup>2</sup>
+<div align="center">
 
-<sup>1</sup> University of Illinois Urbana-Champaign  
-<sup>2</sup> Microsoft Research
+[Rui Yang](https://yangrui2015.github.io/)<sup>1*†</sup>, [Qianhui Wu](https://qianhuiwu.github.io/)<sup>2*†</sup>, [Yuxi Chen](https://www.linkedin.com/in/yuxichen6/)<sup>1</sup>, [Hao Bai](https://biechi.github.io/)<sup>1</sup>, [Wenlin Yao](https://wenlinyao.github.io)<sup>2</sup>, [Hao Cheng](https://sites.google.com/site/hcheng2site/Home)<sup>2</sup>,<br>
+[Baolin Peng](https://www.microsoft.com/en-us/research/people/baolinpeng/)<sup>2</sup>, [Huan Zhang](https://huan-zhang.com)<sup>1</sup>, [Tong Zhang](https://tongzhang-ml.org)<sup>1</sup>, [Jianfeng Gao](https://www.microsoft.com/en-us/research/people/jfgao/)<sup>2</sup>
+
+<sup>1</sup> University of Illinois Urbana-Champaign, <sup>2</sup> Microsoft Research
+
+</div>
 
 *Equal contribution. † Project lead 
 
-Links: [Code](https://github.com/OpenWebRL/OpenWebRL) | [Hugging Face](https://huggingface.co/OpenWebRL)
+Links: [Paper](#) | [Hugging Face](https://huggingface.co/OpenWebRL)
 
 OpenWebRL is a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL.
 
