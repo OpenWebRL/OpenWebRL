@@ -15,7 +15,7 @@ Links: [Paper](#) | [Hugging Face](https://huggingface.co/OpenWebRL)
 
 </div>
 
-OpenWebRL is a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL.
+OpenWebRL is a framework for training visual web agents with online multi-turn reinforcement learning on live websites. The repository builds on top of the Megatron / SGLang-based `slime` training stack and adds the browser rollout, reward, data, and evaluation components needed for web-agent RL. For large-scale parallel rollouts, OpenWebRL integrates with [Orchard](https://github.com/microsoft/Orchard), an open-source sandbox environment that provides network-isolated browser instances at scale. We also support local process for web environments.
 
 The main browser-agent implementation lives in [`openwebrl/`](openwebrl/).
 It supports Playwright-based browser interaction, multi-turn multimodal
@@ -96,6 +96,8 @@ The browser environment can run in two modes configured in
 |---|---|
 | `local_process` | Starts local `env_server.py` subprocesses on this machine. Useful for debugging and small evaluation runs. |
 | `sandbox` | Uses a sandbox orchestrator to create isolated browser pods for large-scale parallel rollout. |
+
+We recommend sandbox mode for large-scale rollouts. OpenWebRL integrates with [Orchard](https://github.com/microsoft/Orchard), an open-source Kubernetes-native sandbox framework that provides per-episode network isolation and scales to hundreds of concurrent browser instances. Isolation significantly reduces the rate at which real websites block agent traffic — in our Online-Mind2Web evaluation without browser base service, the block rate dropped from **25.7% (local process) to 17.7% (Orchard sandbox)**. This advantage is amplified during online RL, where GRPO-style group rollouts repeatedly query the same site within a single training step, making per-site rate limiting a much more severe bottleneck.
 
 For sandbox mode, build and publish the browser environment image to a registry
 your cluster can pull from:
