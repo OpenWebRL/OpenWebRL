@@ -27,7 +27,7 @@ The root [README.md](../README.md) is the main project entry point. This documen
 | Mode | Description | Typical Use |
 |---|---|---|
 | `local_process` | Starts local `openwebrl.docker.env_server` subprocesses and talks to them over HTTP. | Local smoke tests and small evaluations. |
-| `sandbox` | Creates fresh sandbox pods through the sandbox orchestrator, starts `env_server` inside each pod, and deletes pods on exit. | Scalable training and evaluation. |
+| `sandbox` | Creates fresh sandbox pods through the sandbox orchestrator ([Orchard](https://github.com/microsoft/Orchard)), starts `env_server` inside each pod, and deletes pods on exit. | Scalable training and evaluation. |
 
 The Docker server can also be run directly for validating the browser image and HTTP API. The training/evaluation launchers use `local_process` or `sandbox`.
 
@@ -76,6 +76,8 @@ export SLIME_BROWSER_LOCAL_PROCESS_PORT_LOCK_DIR=/tmp/slime_browser_local_proces
 ```
 
 ### Sandbox Training/Evaluation
+
+OpenWebRL's sandbox mode is designed to work with [Orchard](https://github.com/microsoft/Orchard), an open-source Kubernetes-native sandbox framework that provides per-episode network isolation and scales to hundreds of concurrent browser instances. Compared to `local_process`, sandbox isolation significantly reduces the rate at which websites block agent traffic — particularly important during online RL where GRPO-style group rollouts repeatedly query the same site within a single training step.
 
 Build and publish a browser environment image that your sandbox cluster can pull:
 
