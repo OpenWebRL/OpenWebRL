@@ -1,0 +1,168 @@
+# OpenWebRL SFT Warm Start
+
+This directory contains the supervised fine-tuning workflow used to train the
+OpenWebRL SFT checkpoint before online RL.
+
+The intended pipeline is:
+
+```text
+OpenWebRL SFT trajectories -> LLaMAFactory SFT checkpoint -> OpenWebRL online RL initialization
+```
+
+The workflow defaults to the released experiment data:
+
+```text
+OpenWebRL/OpenWebRL-SFT-Trajectories
+OpenWebRL_SFT_trajectories.jsonl
+```
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `run_sft_with_llamafactory.sh` | One-command wrapper that downloads the HF dataset, prepares LLaMAFactory data, generates config files, launches SFT, and optionally post-processes the checkpoint. |
+| `prepare_llamafactory_sft_data.py` | Converts OpenWebRL trajectory JSONL into LLaMAFactory ShareGPT-style multimodal JSONL and extracts screenshots to PNG files. It does not filter or resample the released SFT trajectories. |
+| `post_process_llamafactory_ckpt.py` | Restores original model config/tokenizer files after LLaMAFactory saving, and can fix MoE expert tensor layout when needed. |
+
+## Quick Start
+
+First make sure the LLaMAFactory uv environment has already been created under
+`LLAMAFACTORY_ROOT`. A quick check is:
+
+```bash
+cd /root/LlamaFactory
+uv run python -c "import llamafactory; print('ok')"
+```
+
+Then set the LLaMAFactory checkout and model, and run from the OpenWebRL root:
+
+```bash
+LLAMAFACTORY_ROOT=/root/LlamaFactory \
+MODEL_NAME_OR_PATH=Qwen/Qwen3-VL-4B-Thinking \
+OUTPUT_DIR=/path/to/openwebrl_sft_ckpt \
+bash sft/run_sft_with_llamafactory.sh
+```
+
+The wrapper runs dataset download, data preparation, LLaMAFactory training, and
+optional checkpoint post-processing through `uv run` from `LLAMAFACTORY_ROOT`.
+
+By default, the script downloads `OpenWebRL_SFT_trajectories.jsonl` from the
+Hugging Face dataset repo. To use an already-downloaded copy:
+
+```bash
+OPENWEBRL_SFT_RAW_DATA=/path/to/OpenWebRL_SFT_trajectories.jsonl \
+bash sft/run_sft_with_llamafactory.sh
+```
+
+For a cheap data-preparation smoke test without training:
+
+```bash
+RUN_TRAIN=0 MAX_ROWS=10 bash sft/run_sft_with_llamafactory.sh
+```
+
+The script writes generated data and configs under:
+
+```text
+outputs/sft/llamafactory/
+```
+
+This path is ignored by git.
+
+## Important Defaults
+
+The default training config follows the settings used for the OpenWebRL SFT
+warm start:
+
+- `stage: sft`
+- `finetuning_type: full`
+- `template: qwen3_vl`
+- `cutoff_len: 36864`
+- `mask_history: true`
+- `freeze_vision_tower: true`
+- `freeze_multi_modal_projector: true`
+- `freeze_language_model: false`
+
+`mask_history: true` is important because each row contains the full browser
+conversation context up to the current turn. With history masking, LLaMAFactory
+trains on the current assistant turn instead of re-supervising earlier assistant
+turns in the context.
+
+## Common Environment Overrides
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LLAMAFACTORY_ROOT` | `/root/LlamaFactory` | Local LLaMAFactory checkout. |
+| `UV` | `uv` | uv executable used to run commands inside the LLaMAFactory environment. |
+| `HF_DATASET_REPO` | `OpenWebRL/OpenWebRL-SFT-Trajectories` | Hugging Face dataset repo. |
+| `HF_DATASET_FILE` | `OpenWebRL_SFT_trajectories.jsonl` | Dataset file to download. |
+| `OPENWEBRL_SFT_RAW_DATA` | unset | Local raw JSONL override. |
+| `OPENWEBRL_SFT_WORK_DIR` | `outputs/sft/llamafactory` | Generated data/config/checkpoint workspace. |
+| `MODEL_NAME_OR_PATH` | `Qwen/Qwen3-VL-4B-Thinking` | Base model or local model path for SFT. |
+| `OUTPUT_DIR` | `outputs/sft/llamafactory/checkpoints/qwen3-vl-openwebrl-sft` | LLaMAFactory output checkpoint dir. |
+| `REPORT_TO` | `none` | LLaMAFactory reporting backend, e.g. `wandb`. |
+| `RUN_TRAIN` | `1` | Set to `0` to only prepare data and configs. |
+| `RUN_POST_PROCESS` | `0` | Set to `1` to post-process the output checkpoint after training. |
+| `FIX_MOE_EXPERTS` | `0` | Set to `1` for MoE checkpoints that need expert tensor transposition. |
+
+Distributed training options such as `FORCE_TORCHRUN`, `NNODES`,
+`NODE_RANK`, `MASTER_ADDR`, `MASTER_PORT`, and `CUDA_VISIBLE_DEVICES` are passed
+through to LLaMAFactory if set in the environment.
+
+## Output Data Format
+
+`prepare_llamafactory_sft_data.py` creates a JSONL file where each row has:
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "... <image> ..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "images": ["images/000000_task_...png"]
+}
+```
+
+It also generates one PNG screenshot file per example. The wrapper writes a
+matching `dataset_info.json` so LLaMAFactory can load the data with:
+
+```yaml
+formatting: sharegpt
+columns:
+  messages: messages
+  images: images
+tags:
+  role_tag: role
+  content_tag: content
+  user_tag: user
+  assistant_tag: assistant
+  system_tag: system
+```
+
+The released `OpenWebRL_SFT_trajectories.jsonl` file is already the curated
+experiment data. The preparation script only changes format and image storage;
+it does not filter by reward, captcha text, task id, or rollout metadata.
+
+## Checkpoint Post-Processing
+
+LLaMAFactory may save config/tokenizer files in a form that is inconvenient for
+SGLang, vLLM, or later OpenWebRL RL initialization. The post-processing script
+restores config/tokenizer files from the original base model while preserving
+trained weights:
+
+```bash
+cd /root/LlamaFactory
+uv run python /root/OpenWebRL/sft/post_process_llamafactory_ckpt.py \
+  --ckpt-path /path/to/openwebrl_sft_ckpt \
+  --original-model-path Qwen/Qwen3-VL-4B-Thinking
+```
+
+For MoE checkpoints that need expert tensor layout fixes:
+
+```bash
+cd /root/LlamaFactory
+uv run python /root/OpenWebRL/sft/post_process_llamafactory_ckpt.py \
+  --ckpt-path /path/to/openwebrl_sft_ckpt \
+  --original-model-path Qwen/Qwen3-VL-30B-A3B-Thinking \
+  --fix-moe-experts
+```
