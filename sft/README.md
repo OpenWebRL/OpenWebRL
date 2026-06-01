@@ -22,7 +22,7 @@ OpenWebRL_SFT_trajectories.jsonl
 | --- | --- |
 | `run_sft_with_llamafactory.sh` | One-command wrapper that downloads the HF dataset, prepares LLaMAFactory data, generates config files, launches SFT, and optionally post-processes the checkpoint. |
 | `prepare_llamafactory_sft_data.py` | Converts OpenWebRL trajectory JSONL into LLaMAFactory ShareGPT-style multimodal JSONL and extracts screenshots to PNG files. It does not filter or resample the released SFT trajectories. |
-| `post_process_llamafactory_ckpt.py` | Restores original model config/tokenizer files after LLaMAFactory saving, and can fix MoE expert tensor layout when needed. |
+| `post_process_llamafactory_ckpt.py` | Makes a trained LLaMAFactory checkpoint easier to serve and reuse in OpenWebRL by restoring base-model config/tokenizer files while keeping the trained weights. It can also fix MoE expert tensor layout when needed. |
 
 ## Quick Start
 
@@ -45,6 +45,8 @@ bash sft/run_sft_with_llamafactory.sh
 
 The wrapper runs dataset download, data preparation, LLaMAFactory training, and
 optional checkpoint post-processing through `uv run` from `LLAMAFACTORY_ROOT`.
+Set `RUN_POST_PROCESS=1` if the checkpoint will be used directly for serving or
+as the initialization checkpoint for OpenWebRL online RL.
 
 By default, the script downloads `OpenWebRL_SFT_trajectories.jsonl` from the
 Hugging Face dataset repo. To use an already-downloaded copy:
@@ -145,10 +147,42 @@ it does not filter by reward, captcha text, task id, or rollout metadata.
 
 ## Checkpoint Post-Processing
 
-LLaMAFactory may save config/tokenizer files in a form that is inconvenient for
-SGLang, vLLM, or later OpenWebRL RL initialization. The post-processing script
-restores config/tokenizer files from the original base model while preserving
-trained weights:
+Post-processing is the compatibility step after SFT. LLaMAFactory writes the
+trained model weights correctly, but the config, tokenizer, processor, and chat
+template files saved beside those weights may differ from the original
+Hugging Face model files. Those differences can make the checkpoint harder to
+load in SGLang, vLLM, or the OpenWebRL online RL pipeline, especially for
+multimodal Qwen checkpoints where the processor and chat template must match the
+base model.
+
+The post-processing script restores the non-weight files from the original base
+model while preserving the trained SFT weights. It also backs up the
+LLaMAFactory-saved files under `llamafactory_saved/`, so the step is reversible
+at the file level. You should run it when:
+
+- you plan to initialize OpenWebRL online RL from the SFT checkpoint;
+- you plan to serve the checkpoint with SGLang, vLLM, or another inference
+  engine outside LLaMAFactory;
+- the checkpoint fails to load because of tokenizer, processor, chat template,
+  or config mismatches;
+- you trained an MoE checkpoint whose expert tensors need the HF-compatible
+  layout fix.
+
+For the default wrapper, enable post-processing in the same run with:
+
+```bash
+RUN_POST_PROCESS=1 bash sft/run_sft_with_llamafactory.sh
+```
+
+To post-process an already-trained checkpoint without re-running data
+preparation or training:
+
+```bash
+RUN_PREPARE=0 RUN_TRAIN=0 RUN_POST_PROCESS=1 \
+bash sft/run_sft_with_llamafactory.sh
+```
+
+You can also call the script directly:
 
 ```bash
 cd /root/LlamaFactory
@@ -156,6 +190,10 @@ uv run python /root/OpenWebRL/sft/post_process_llamafactory_ckpt.py \
   --ckpt-path /path/to/openwebrl_sft_ckpt \
   --original-model-path Qwen/Qwen3-VL-4B-Thinking
 ```
+
+Add `--include-substeps` if you want to post-process intermediate checkpoint
+directories such as `checkpoint-25`, `checkpoint-50`, and `checkpoint-75` in
+addition to the final output directory.
 
 For MoE checkpoints that need expert tensor layout fixes:
 
