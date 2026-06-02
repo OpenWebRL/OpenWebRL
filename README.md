@@ -11,7 +11,7 @@
 
 *Equal contribution. † Project lead 
 
-Links: [Paper](#) | [Hugging Face](https://huggingface.co/OpenWebRL) | [Orchard Env](https://github.com/microsoft/Orchard)
+Links: [Paper](https://arxiv.org/abs/2606.02031) | [Website](https://openwebrl.github.io) | [Hugging Face](https://huggingface.co/OpenWebRL) | [Orchard Env](https://github.com/microsoft/Orchard)
 
 </div>
 
@@ -254,10 +254,13 @@ WebGym for providing the initial browser-task data source.
 ## Citation
 
 ```bibtex
-@article{yang2026openwebrl,
-  title   = {OpenWebRL: Demystifying Online Multi-turn Reinforcement Learning for Visual Web Agents},
-  author  = {Rui Yang and Qianhui Wu and Yuxi Chen and Hao Bai and Wenlin Yao and Hao Cheng and Baolin Peng and Huan Zhang and Tong Zhang and Jianfeng Gao},
-  journal = {arXiv preprint},
-  year    = {2026}
+@misc{yang2026openwebrldemystifyingonlinemultiturn,
+      title={OpenWebRL: Demystifying Online Multi-turn Reinforcement Learning for Visual Web Agents},
+      author={Rui Yang and Qianhui Wu and Yuxi Chen and Hao Bai and Wenlin Yao and Hao Cheng and Baolin Peng and Huan Zhang and Tong Zhang and Jianfeng Gao},
+      year={2026},
+      eprint={2606.02031},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.02031},
 }
 ```
