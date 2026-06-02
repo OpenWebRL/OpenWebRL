@@ -2,7 +2,7 @@
 
 # OpenWebRL: Online Multi-Turn Reinforcement Learning for Visual Web Agents
 
-[Rui Yang](https://yangrui2015.github.io/)<sup>1*†</sup>, [Qianhui Wu](https://qianhuiwu.github.io/)<sup>2*†</sup>, [Yuxi Chen](https://www.linkedin.com/in/yuxichen6/)<sup>1</sup>, [Hao Bai](https://biechi.github.io/)<sup>1</sup>, [Wenlin Yao](https://wenlinyao.github.io)<sup>2</sup>, [Hao Cheng](https://sites.google.com/site/hcheng2site/Home)<sup>2</sup>,<br>
+[Rui Yang](https://yangrui2015.github.io/)<sup>1*</sup>, [Qianhui Wu](https://qianhuiwu.github.io/)<sup>2*†</sup>, [Yuxi Chen](https://www.linkedin.com/in/yuxichen6/)<sup>1</sup>, [Hao Bai](https://biechi.github.io/)<sup>1</sup>, [Wenlin Yao](https://wenlinyao.github.io)<sup>2</sup>, [Hao Cheng](https://sites.google.com/site/hcheng2site/Home)<sup>2</sup>,<br>
 [Baolin Peng](https://www.microsoft.com/en-us/research/people/baolinpeng/)<sup>2</sup>, [Huan Zhang](https://huan-zhang.com)<sup>1</sup>, [Tong Zhang](https://tongzhang-ml.org)<sup>1</sup>, [Jianfeng Gao](https://www.microsoft.com/en-us/research/people/jfgao/)<sup>2</sup>
 
 <sup>1</sup> University of Illinois Urbana-Champaign, <sup>2</sup> Microsoft Research
