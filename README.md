@@ -27,7 +27,8 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
 |---|---|---|
 | Data preparation | Uses curated browser tasks in parquet / JSONL format and can convert benchmark JSONL files to the training parquet schema. | [`openwebrl/data/`](openwebrl/data/) |
 | Browser rollout | Runs multi-turn browser episodes with screenshots, tool calls, environment feedback, and response-format checks. | [`openwebrl/generate_browser.py`](openwebrl/generate_browser.py) |
-| Online RL training | Trains a visual web agent with turn-level or trajectory-level browser rollouts and judge-based rewards. See [Training Scripts](#training-scripts) for available launchers. | [`scripts/run_browser_Qwen3VL_4B_Instruct.sh`](scripts/run_browser_Qwen3VL_4B_Instruct.sh) |
+| SFT warm start (optional, recommended) | Trains a supervised fine-tuned checkpoint to initialize online RL, via LLaMAFactory on released OpenWebRL trajectories. RL can also start directly from the base VLM. See [`sft/README.md`](sft/README.md). | [`sft/run_sft_with_llamafactory.sh`](sft/run_sft_with_llamafactory.sh) |
+| Online RL training | Trains a visual web agent with turn-level or trajectory-level browser rollouts and judge-based rewards, starting from the base VLM or, recommended, an SFT warm-start checkpoint. See [Training Scripts](#training-scripts) for available launchers. | [`scripts/run_browser_Qwen3VL_4B_Instruct.sh`](scripts/run_browser_Qwen3VL_4B_Instruct.sh) |
 | Reward / judge | Combines format rewards with VLM-as-a-judge success evaluation through OpenAI-compatible, Azure, or self-hosted endpoints. | [`openwebrl/reward_browser.py`](openwebrl/reward_browser.py) |
 | Evaluation | Evaluates converted Hugging Face checkpoints on browser benchmark task files. | [`scripts/run_evaluation.sh`](scripts/run_evaluation.sh), [`openwebrl/run_evaluate.py`](openwebrl/run_evaluate.py) |
 | Optional judge SFT | Contains utilities for training and evaluating a smaller browser judge model. | [`openwebrl/judge/`](openwebrl/judge/) |
@@ -47,6 +48,11 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
 ├── docker/                        # Base training Dockerfile and patches
 ├── scripts/                       # OpenWebRL training/evaluation/conversion entrypoints
 │   └── model_configs/             # Model argument presets used by conversion/training
+├── sft/                           # SFT warm-start workflow (LLaMAFactory) producing the RL init checkpoint
+│   ├── README.md                  # SFT pipeline notes
+│   ├── run_sft_with_llamafactory.sh
+│   ├── prepare_llamafactory_sft_data.py
+│   └── post_process_llamafactory_ckpt.py
 └── openwebrl/
     ├── README.md                  # Detailed browser-environment notes
     ├── generate_browser.py        # Multi-turn browser rollout driver
@@ -95,7 +101,7 @@ The browser environment can run in two modes configured in
 | Mode | Description |
 |---|---|
 | `local_process` | Starts local `env_server.py` subprocesses on this machine. Useful for debugging and small evaluation runs. |
-| `sandbox` | Uses a sandbox orchestrator to create isolated browser pods for large-scale parallel rollout. |
+| `sandbox` | Uses [Orchard Env](https://github.com/microsoft/Orchard) to create isolated browser pods for large-scale parallel rollout. |
 
 We recommend sandbox mode for large-scale rollouts. OpenWebRL integrates with [Orchard](https://github.com/microsoft/Orchard), an open-source Kubernetes-native sandbox framework that provides per-episode network isolation and scales to hundreds of concurrent browser instances. Isolation significantly reduces the rate at which real websites block agent traffic — in our Online-Mind2Web evaluation without browser base service, the block rate dropped from **25.7% (local process) to 17.7% (Orchard sandbox)**. This advantage is amplified during online RL, where GRPO-style group rollouts repeatedly query the same site within a single training step, making per-site rate limiting a much more severe bottleneck.
 
@@ -190,6 +196,8 @@ mode: local_process
 ```
 
 ### 3. Train with online browser RL
+
+By default the launcher's `MODEL_NAME` points to a model under `SLIME_MODEL_ROOT`, and online RL can start directly from a base VLM. For best results we **recommend** an SFT warm start first and initializing RL from that checkpoint. The SFT workflow lives in [`sft/`](sft/) — it trains an OpenWebRL SFT checkpoint from the released trajectories with LLaMAFactory and post-processes it for RL reuse (see [`sft/README.md`](sft/README.md)). To include the SFT stage, produce the checkpoint, place it under `SLIME_MODEL_ROOT`, and set `MODEL_NAME` to its path before launching RL.
 
 #### Training Scripts
 
