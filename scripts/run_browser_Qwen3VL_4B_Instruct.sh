@@ -37,14 +37,7 @@ RUN_TIMESTAMP="$(date -u +%Y%m%d_%H%M%S)"
 
 
 # MODEL_NAME="Qwen3-VL-4B-Thinking"
-# MODEL_NAME=qwen3-vl-4b-thinking-webgym_webgym_t30980_s256k_pae_webvoyager_core-epoch-1-lr-1e-5-bs-2x8/checkpoint-25
-# MODEL_NAME=qwen3-vl-4b-thinking-webgym_webgym_t30980_s256k_pae_webvoyager_core-epoch-3-lr-1e-5-bs-2x8/checkpoint-75
-# MODEL_NAME=qwen3-vl-4b-thinking-webgym_webgym_t30980_s256k_pae_webvoyager_core-epoch-3-lr-1e-5-bs-2x8/checkpoint-75
-# MODEL_NAME=qwen3-vl-4b-thinking-webgym_webgym_core_insta_1-epoch-3-lr-1e-5-bs-2x8/checkpoint-165
-# MODEL_NAME=qwen3-vl-4b-thinking-webgym_webgym_core_insta_0_1_2-epoch-3-lr-1e-5-bs-2x8/checkpoint-336
-# MODEL_NAME=qwen3-vl-4b-thinking-website_diverse_pae_webvoyager_t4826_s42m50_insta_v3_t26154_s42m1-epoch-3-lr-1e-5-bs-2x8 
-# MODEL_NAME=qwen3-vl-8b-thinking-website_diverse_pae_webvoyager_t4826_s42m50_insta_v3_t26154_s42m1-epoch-3-lr-1e-5-bs-2x8
-MODEL_NAME=qwen3-vl-8b-thinking-webgym_webgym_core_insta_1-epoch-3-lr-1e-5-bs-2x8/checkpoint-165
+MODEL_NAME="OpenWebRL/OpenWebRL-4B-SFT"
 
 
 MODEL_ROOT="${SLIME_MODEL_ROOT:-${REPO_ROOT}/models}"
@@ -143,6 +136,10 @@ fi
 
 NUM_GPUS=8
 HF_CHECKPOINT="${MODEL_ROOT}/${MODEL_NAME}"
+HF_REPO="${MODEL_NAME}"
+if [[ "${MODEL_NAME}" != */* ]]; then
+  HF_REPO="Qwen/${MODEL_NAME}"
+fi
 if [ -n "${SLIME_LOAD_CHECKPOINT}" ]; then
   LOAD_CHECKPOINT="${SLIME_LOAD_CHECKPOINT}"
 else
@@ -203,7 +200,7 @@ export SLIME_ROUTER_ACCESS_LOG=0
 
 if [ ! -d "${HF_CHECKPOINT}" ]; then
   mkdir -p "${MODEL_ROOT}"
-  huggingface-cli download "Qwen/${MODEL_NAME}" --local-dir "${HF_CHECKPOINT}" || true
+  huggingface-cli download "${HF_REPO}" --local-dir "${HF_CHECKPOINT}" || true
 fi
 
 if [ "${LOAD_CHECKPOINT}" != "${HF_CHECKPOINT}" ] && [ ! -f "${LOAD_CHECKPOINT}/latest_checkpointed_iteration.txt" ]; then

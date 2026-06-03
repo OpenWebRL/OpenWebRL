@@ -35,7 +35,7 @@ export SLIME_BROWSER_SANDBOX_MANIFEST_DIR=/tmp/slime_browser_sandboxes_train
 
 
 
-MODEL_NAME="Qwen3-VL-8B-Instruct"
+MODEL_NAME="OpenWebRL/OpenWebRL-8B-SFT"
 BROWSER_TRAIN_LEVEL="${BROWSER_TRAIN_LEVEL:-turn}" # "turn" or "trajectory"
 JUDGE_PROMPT_VARIANT="${JUDGE_PROMPT_VARIANT:-action_history}" # action_history
 JUDGE_MODEL="${JUDGE_MODEL:-gpt-4.1}"
@@ -98,6 +98,10 @@ fi
 NUM_GPUS=8
 MODEL_ROOT="${SLIME_MODEL_ROOT:-${REPO_ROOT}/models}"
 HF_CHECKPOINT="${MODEL_ROOT}/${MODEL_NAME}"
+HF_REPO="${MODEL_NAME}"
+if [[ "${MODEL_NAME}" != */* ]]; then
+  HF_REPO="Qwen/${MODEL_NAME}"
+fi
 LOAD_CHECKPOINT="${HF_CHECKPOINT}"
 EXTERNAL_RAY="${SLIME_SCRIPT_EXTERNAL_RAY:-0}"
 
@@ -139,7 +143,7 @@ export SLIME_ROUTER_ACCESS_LOG=0
 # ==============================================================================
 
 mkdir -p "${MODEL_ROOT}"
-huggingface-cli download "Qwen/${MODEL_NAME}" --local-dir "${HF_CHECKPOINT}" || true
+huggingface-cli download "${HF_REPO}" --local-dir "${HF_CHECKPOINT}" || true
 
 [ -f "${TRAIN_DATA}" ] || { echo "ERROR: ${TRAIN_DATA} not found"; exit 1; }
 [ -f "${EVAL_DATA}" ] || { echo "ERROR: ${EVAL_DATA} not found"; exit 1; }

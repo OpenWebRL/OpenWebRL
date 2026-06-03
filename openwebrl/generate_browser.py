@@ -595,12 +595,14 @@ def _try_load_task_from_jsonl(task_id: str, task_metadata: dict[str, Any] | None
         if os.path.isfile(configured_path):
             jsonl_paths.append(configured_path)
 
-    fallback_paths = sorted(
-        path for path in (
-            os.path.join(tasks_dir, name) for name in os.listdir(tasks_dir)
+    fallback_paths = []
+    if os.path.isdir(tasks_dir):
+        fallback_paths = sorted(
+            path for path in (
+                os.path.join(tasks_dir, name) for name in os.listdir(tasks_dir)
+            )
+            if path.endswith(".jsonl") and os.path.isfile(path)
         )
-        if path.endswith(".jsonl") and os.path.isfile(path)
-    )
     for path in fallback_paths:
         if path not in jsonl_paths:
             jsonl_paths.append(path)
