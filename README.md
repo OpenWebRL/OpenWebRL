@@ -21,7 +21,13 @@ The main browser-agent implementation lives in [`openwebrl/`](openwebrl/).
 It supports Playwright-based browser interaction, multi-turn multimodal
 rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge rewards, and training/evaluation scripts for Qwen3-VL style visual language models.
 
-## Method At A Glance
+## 📋 TODO
+
+- [x] Support SFT with Qwen3.5
+- [ ] Support RL with Qwen3.5
+- [ ] Release demo
+
+## 🔭 Method At A Glance
 
 | Stage | What it does | Main entry point |
 |---|---|---|
@@ -33,7 +39,7 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
 | Evaluation | Evaluates converted Hugging Face checkpoints on browser benchmark task files. | [`scripts/run_evaluation.sh`](scripts/run_evaluation.sh), [`openwebrl/run_evaluate.py`](openwebrl/run_evaluate.py) |
 | Optional judge SFT | Contains utilities for training and evaluating a smaller browser judge model. | [`openwebrl/judge/`](openwebrl/judge/) |
 
-## Repository Layout
+## 📂 Repository Layout
 
 ```text
 .
@@ -51,8 +57,9 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
 ├── sft/                           # SFT warm-start workflow (LLaMAFactory) producing the RL init checkpoint
 │   ├── README.md                  # SFT pipeline notes
 │   ├── run_sft_with_llamafactory.sh
-│   ├── prepare_llamafactory_sft_data.py
-│   └── post_process_llamafactory_ckpt.py
+│   ├── convert_to_openai_messages.py        # Stage 1: trajectories -> canonical OpenAI format
+│   ├── prepare_openai_for_llamafactory.py   # Stage 2: canonical -> LLaMAFactory data (official chat template)
+│   └── post_process_llamafactory_ckpt.py    # restore base-model config/tokenizer onto the trained checkpoint for serving/RL.
 └── openwebrl/
     ├── README.md                  # Detailed browser-environment notes
     ├── generate_browser.py        # Multi-turn browser rollout driver
@@ -70,7 +77,7 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
     └── judge/                     # Optional judge-evaluation utilities
 ```
 
-## Included Data
+## 📊 Included Data
 
 The release includes small browser datasets under [`openwebrl/data/`](openwebrl/data/):
 
@@ -82,7 +89,7 @@ The release includes small browser datasets under [`openwebrl/data/`](openwebrl/
 
 
 
-## Installation
+## 🛠️ Installation
 
 OpenWebRL expects Python 3.10 or newer and a CUDA-capable environment for the
 full training stack.
@@ -118,7 +125,7 @@ docker push <your-registry>/browser-env:latest
 Then set `BROWSER_SANDBOX_IMAGE`, `SANDBOX_ORCHESTRATOR_URL`, and
 `SANDBOX_API_KEY` in your environment.
 
-## Required Environment
+## 🔑 Required Environment
 
 Start from the template:
 
@@ -166,7 +173,7 @@ Experiment tracking:
 | `WANDB_API_KEY` | Optional. If unset, W&B logging stays disabled in the launcher scripts. |
 | `WANDB_ENTITY` | Optional W&B entity/team. |
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Prepare the environment
 
@@ -251,7 +258,7 @@ TASK_FILE=openwebrl/data/online-mind2web.jsonl \
 bash scripts/run_evaluation_local.sh
 ```
 
-## Acknowledgements
+## 🙏 Acknowledgements
 
 This repository builds on [slime](https://github.com/THUDM/slime),
 [SGLang](https://github.com/sgl-project/sglang), Megatron-LM,
@@ -259,7 +266,7 @@ Megatron-Bridge, Playwright, and the open-source VLM/web-agent ecosystem.
 We also thank Qwen for releasing the base VLMs used in our experiments, and
 WebGym for providing the initial browser-task data source.
 
-## Citation
+## 📚 Citation
 
 ```bibtex
 @misc{yang2026openwebrldemystifyingonlinemultiturn,

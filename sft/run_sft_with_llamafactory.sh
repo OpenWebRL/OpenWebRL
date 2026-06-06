@@ -27,18 +27,65 @@ OPENWEBRL_SFT_RAW_DATA="${OPENWEBRL_SFT_RAW_DATA:-}"
 
 WORK_DIR="${OPENWEBRL_SFT_WORK_DIR:-${OPENWEBRL_ROOT}/outputs/sft/llamafactory}"
 DATA_DIR="${OPENWEBRL_SFT_DATA_DIR:-${WORK_DIR}/data}"
-CONFIG_DIR="${OPENWEBRL_SFT_CONFIG_DIR:-${WORK_DIR}/configs}"
 RAW_DATA_DIR="${OPENWEBRL_SFT_RAW_DATA_DIR:-${WORK_DIR}/raw}"
-PREPARED_DATA="${OPENWEBRL_SFT_PREPARED_DATA:-${DATA_DIR}/openwebrl_sft_data.jsonl}"
 DATASET_NAME="${OPENWEBRL_SFT_DATASET_NAME:-openwebrl_sft_trajectories}"
-DATASET_INFO_PATH="${DATA_DIR}/dataset_info.json"
-TRAIN_CONFIG="${OPENWEBRL_SFT_TRAIN_CONFIG:-${CONFIG_DIR}/openwebrl_qwen3_vl_sft.yaml}"
+# Model-agnostic canonical OpenAI-format episodes (Stage 1 output). Shared across
+# every base model / tool format; built once and cached.
+CANONICAL_DATA="${OPENWEBRL_SFT_CANONICAL_DATA:-${DATA_DIR}/openwebrl_sft_openai.jsonl}"
 
-MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-VL-4B-Thinking}"
-OUTPUT_DIR="${OUTPUT_DIR:-${WORK_DIR}/checkpoints/qwen3-vl-openwebrl-sft}"
-RUN_NAME="${RUN_NAME:-qwen3-vl-openwebrl-sft}"
+# Model family preset. Picks sensible defaults for the base model, chat
+# template, and checkpoint naming. Every value below stays overridable via its
+# own environment variable. The SFT data is built once into a model-agnostic
+# canonical format (Stage 1), then rendered per model by Stage 2 using that
+# model's OFFICIAL chat template (apply_chat_template) — the same call the
+# OpenWebRL runtime uses at inference — so each family gets its own native
+# tool-calling format automatically.
+#   qwen3_vl -> multimodal Qwen3-VL warm start (Qwen3-VL/Hermes JSON tool calls).
+#   qwen3_5  -> Qwen3.5 warm start (Qwen3.5 XML function tool calls).
+MODEL_FAMILY="${MODEL_FAMILY:-qwen3_vl}"
+case "${MODEL_FAMILY}" in
+  qwen3_vl)
+    DEFAULT_MODEL_NAME_OR_PATH="Qwen/Qwen3-VL-4B-Thinking"
+    DEFAULT_TEMPLATE="qwen3_vl"
+    DEFAULT_TRAIN_CONFIG_NAME="openwebrl_qwen3_vl_sft.yaml"
+    ;;
+  qwen3_5)
+    DEFAULT_MODEL_NAME_OR_PATH="Qwen/Qwen3.5-9B"
+    DEFAULT_TEMPLATE="qwen3_5"
+    DEFAULT_TRAIN_CONFIG_NAME="openwebrl_qwen3_5_sft.yaml"
+    ;;
+  *)
+    echo "ERROR: Unknown MODEL_FAMILY='${MODEL_FAMILY}'. Supported: qwen3_vl, qwen3_5." >&2
+    exit 1
+    ;;
+esac
 
-TEMPLATE="${TEMPLATE:-qwen3_vl}"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${DEFAULT_MODEL_NAME_OR_PATH}}"
+# Name the checkpoint dir after the base model, e.g. Qwen/Qwen3.5-27B -> qwen3.5-27b-openwebrl-sft.
+DEFAULT_CKPT_SLUG="$(basename "${MODEL_NAME_OR_PATH}" | tr '[:upper:]' '[:lower:]')-openwebrl-sft"
+OUTPUT_DIR="${OUTPUT_DIR:-${WORK_DIR}/checkpoints/${DEFAULT_CKPT_SLUG}}"
+RUN_NAME="${RUN_NAME:-${DEFAULT_CKPT_SLUG}}"
+# The train config lives inside the checkpoint dir so it travels with the checkpoint.
+TRAIN_CONFIG="${OPENWEBRL_SFT_TRAIN_CONFIG:-${OUTPUT_DIR}/${DEFAULT_TRAIN_CONFIG_NAME}}"
+
+TEMPLATE="${TEMPLATE:-${DEFAULT_TEMPLATE}}"
+# Granularity: PER_TURN=1 expands each episode into per-turn examples (single
+# current screenshot) and masks the history assistant responses (mask_history),
+# reproducing the released recipe. PER_TURN=0 keeps full-episode trajectories
+# (all screenshots) and supervises every assistant turn in one pass.
+PER_TURN="${PER_TURN:-1}"
+if [[ "${PER_TURN}" == "1" ]]; then
+  GRANULARITY="perturn"
+  MASK_HISTORY="${MASK_HISTORY:-true}"
+else
+  GRANULARITY="trajectory"
+  MASK_HISTORY="${MASK_HISTORY:-false}"
+fi
+# Per-config workspace so different (model template, granularity) renders never
+# clobber each other's JSONL / images / dataset_info.json.
+PREP_DIR="${OPENWEBRL_SFT_PREP_DIR:-${DATA_DIR}/${TEMPLATE}_${GRANULARITY}}"
+PREPARED_DATA="${OPENWEBRL_SFT_PREPARED_DATA:-${PREP_DIR}/openwebrl_sft_llamafactory.jsonl}"
+DATASET_INFO_PATH="${PREP_DIR}/dataset_info.json"
 CUTOFF_LEN="${CUTOFF_LEN:-36864}"
 IMAGE_MAX_PIXELS="${IMAGE_MAX_PIXELS:-262144}"
 VIDEO_MAX_PIXELS="${VIDEO_MAX_PIXELS:-16384}"
@@ -57,15 +104,35 @@ LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
 BF16="${BF16:-true}"
 SAVE_STRATEGY="${SAVE_STRATEGY:-epoch}"
-REPORT_TO="${REPORT_TO:-none}"
+# Reporting backend. Defaults to Weights & Biases. When wandb is selected for a
+# real training run but no WANDB_API_KEY is available, prompt for one in an
+# interactive shell, or fail with instructions in a non-interactive one. Pass
+# REPORT_TO=none to opt out.
+REPORT_TO="${REPORT_TO:-wandb}"
+if [[ "${REPORT_TO}" == "wandb" && -z "${WANDB_API_KEY:-}" && "${RUN_TRAIN:-1}" == "1" ]]; then
+  if [[ -t 0 ]]; then
+    read -rsp "WANDB_API_KEY is not set. Paste your W&B API key (leave empty to disable wandb): " WANDB_API_KEY || true
+    echo
+    if [[ -z "${WANDB_API_KEY}" ]]; then
+      echo "No key entered; disabling W&B logging (REPORT_TO=none)." >&2
+      REPORT_TO="none"
+    else
+      export WANDB_API_KEY
+    fi
+  else
+    echo "ERROR: REPORT_TO=wandb but WANDB_API_KEY is not set." >&2
+    echo "       Export WANDB_API_KEY (or run 'wandb login'), or pass REPORT_TO=none to disable W&B." >&2
+    exit 1
+  fi
+fi
 PREPROCESSING_NUM_WORKERS="${PREPROCESSING_NUM_WORKERS:-16}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 DDP_TIMEOUT="${DDP_TIMEOUT:-180000000}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-null}"
 
-RUN_PREPARE="${RUN_PREPARE:-1}"
+RUN_DATA_PREPARE="${RUN_DATA_PREPARE:-1}"
 RUN_TRAIN="${RUN_TRAIN:-1}"
-RUN_POST_PROCESS="${RUN_POST_PROCESS:-0}"
+RUN_POST_PROCESS="${RUN_POST_PROCESS:-1}"
 POST_PROCESS_INCLUDE_SUBSTEPS="${POST_PROCESS_INCLUDE_SUBSTEPS:-1}"
 FIX_MOE_EXPERTS="${FIX_MOE_EXPERTS:-0}"
 MAX_ROWS="${MAX_ROWS:-}"
@@ -96,7 +163,7 @@ run_llamafactory_cli() {
   (cd "${LLAMAFACTORY_ROOT}" && "${UV}" run llamafactory-cli "$@")
 }
 
-mkdir -p "${DATA_DIR}" "${CONFIG_DIR}" "${RAW_DATA_DIR}" "${OUTPUT_DIR}"
+mkdir -p "${DATA_DIR}" "${PREP_DIR}" "${RAW_DATA_DIR}" "${OUTPUT_DIR}"
 
 require_dir "${LLAMAFACTORY_ROOT}" "LLaMAFactory root"
 if ! command -v "${UV}" >/dev/null 2>&1; then
@@ -104,7 +171,8 @@ if ! command -v "${UV}" >/dev/null 2>&1; then
   exit 1
 fi
 require_file "${LLAMAFACTORY_ROOT}/pyproject.toml" "LLaMAFactory pyproject.toml"
-require_file "${SCRIPT_DIR}/prepare_llamafactory_sft_data.py" "SFT data converter"
+require_file "${SCRIPT_DIR}/convert_to_openai_messages.py" "Stage 1 canonical converter"
+require_file "${SCRIPT_DIR}/prepare_openai_for_llamafactory.py" "Stage 2 LLaMAFactory prep"
 require_file "${SCRIPT_DIR}/post_process_llamafactory_ckpt.py" "checkpoint post-processor"
 
 if [[ -z "${OPENWEBRL_SFT_RAW_DATA}" ]]; then
@@ -127,46 +195,46 @@ fi
 
 require_file "${OPENWEBRL_SFT_RAW_DATA}" "OpenWebRL SFT trajectory JSONL"
 
-if [[ "${RUN_PREPARE}" == "1" || ! -f "${PREPARED_DATA}" ]]; then
-  echo "Preparing LLaMAFactory SFT data ..."
-  PREPARE_ARGS=(
-    "${SCRIPT_DIR}/prepare_llamafactory_sft_data.py"
+# Stage 1: build the model-agnostic canonical OpenAI-format episodes (cached).
+if [[ "${RUN_DATA_PREPARE}" == "1" || ! -f "${CANONICAL_DATA}" ]]; then
+  echo "Stage 1: converting trajectories to canonical OpenAI format ..."
+  CONVERT_ARGS=(
+    "${SCRIPT_DIR}/convert_to_openai_messages.py"
     --input-path "${OPENWEBRL_SFT_RAW_DATA}"
-    --output-path "${PREPARED_DATA}"
-    --image-path-mode relative
+    --output-path "${CANONICAL_DATA}"
   )
   if [[ -n "${MAX_ROWS}" ]]; then
-    PREPARE_ARGS+=(--max-rows "${MAX_ROWS}")
+    CONVERT_ARGS+=(--max-rows "${MAX_ROWS}")
   fi
-  run_llamafactory_python "${PREPARE_ARGS[@]}"
+  run_llamafactory_python "${CONVERT_ARGS[@]}"
 else
-  echo "Skipping data preparation because ${PREPARED_DATA} already exists."
+  echo "Skipping Stage 1 because ${CANONICAL_DATA} already exists."
+fi
+require_file "${CANONICAL_DATA}" "canonical OpenAI-format data"
+
+# Stage 2: render the canonical episodes into LLaMAFactory data for this model
+# using the model's official chat template (apply_chat_template) and the chosen
+# granularity. Also writes dataset_info.json (formatting: sharegpt) next to the output.
+if [[ "${RUN_DATA_PREPARE}" == "1" || ! -f "${PREPARED_DATA}" ]]; then
+  echo "Stage 2: rendering LLaMAFactory data via ${MODEL_NAME_OR_PATH} chat template (${GRANULARITY}) ..."
+  PREP_ARGS=(
+    "${SCRIPT_DIR}/prepare_openai_for_llamafactory.py"
+    --input-path "${CANONICAL_DATA}"
+    --output-path "${PREPARED_DATA}"
+    --model-name-or-path "${MODEL_NAME_OR_PATH}"
+    --dataset-name "${DATASET_NAME}"
+    --image-path-mode relative
+  )
+  if [[ "${PER_TURN}" == "1" ]]; then
+    PREP_ARGS+=(--per-turn)
+  fi
+  run_llamafactory_python "${PREP_ARGS[@]}"
+else
+  echo "Skipping Stage 2 because ${PREPARED_DATA} already exists."
 fi
 
 require_file "${PREPARED_DATA}" "prepared LLaMAFactory data"
-
-export DATASET_INFO_PATH DATASET_NAME PREPARED_DATA
-run_llamafactory_python -c 'import json, os
-from pathlib import Path
-info = {
-    os.environ["DATASET_NAME"]: {
-        "file_name": os.environ["PREPARED_DATA"],
-        "formatting": "sharegpt",
-        "columns": {
-            "messages": "messages",
-            "images": "images"
-        },
-        "tags": {
-            "role_tag": "role",
-            "content_tag": "content",
-            "user_tag": "user",
-            "assistant_tag": "assistant",
-            "system_tag": "system"
-        }
-    }
-}
-Path(os.environ["DATASET_INFO_PATH"]).write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
-'
+require_file "${DATASET_INFO_PATH}" "dataset_info.json"
 
 cat > "${TRAIN_CONFIG}" <<EOF
 ### model
@@ -185,18 +253,18 @@ freeze_language_model: ${FREEZE_LANGUAGE_MODEL}
 deepspeed: ${DEEPSPEED_CONFIG}
 
 ### dataset
-dataset_dir: ${DATA_DIR}
-media_dir: ${DATA_DIR}
+dataset_dir: ${PREP_DIR}
+media_dir: ${PREP_DIR}
 dataset: ${DATASET_NAME}
 template: ${TEMPLATE}
 cutoff_len: ${CUTOFF_LEN}
 preprocessing_num_workers: ${PREPROCESSING_NUM_WORKERS}
 dataloader_num_workers: ${DATALOADER_NUM_WORKERS}
-mask_history: true
+mask_history: ${MASK_HISTORY}
 
 ### output
 output_dir: ${OUTPUT_DIR}
-logging_steps: 10
+logging_steps: 1
 save_strategy: ${SAVE_STRATEGY}
 plot_loss: true
 overwrite_output_dir: true
@@ -216,6 +284,7 @@ ddp_timeout: ${DDP_TIMEOUT}
 resume_from_checkpoint: ${RESUME_FROM_CHECKPOINT}
 EOF
 
+echo "Model family: ${MODEL_FAMILY} | template: ${TEMPLATE} | granularity: ${GRANULARITY} (mask_history=${MASK_HISTORY}) | model: ${MODEL_NAME_OR_PATH}"
 echo "Generated dataset info: ${DATASET_INFO_PATH}"
 echo "Generated train config: ${TRAIN_CONFIG}"
 
