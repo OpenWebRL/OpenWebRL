@@ -37,6 +37,45 @@ _DEFAULT_PORT_LOCK_DIR = "/tmp/slime_browser_local_process_ports"
 _ENV_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_ENV_DIR, "..", "..", ".."))
 
+_child_watcher_ready = False
+
+
+def _ensure_asyncio_child_watcher() -> None:
+    """Guarantee asyncio.create_subprocess_exec works from this event loop.
+
+    Inside Ray rollout actors the loop runs on a non-main thread whose active
+    event-loop policy lacks a child watcher, so create_subprocess_exec raises
+    NotImplementedError. Install a ThreadedChildWatcher (safe from any thread)
+    and force the policy to return it. Idempotent.
+    """
+    global _child_watcher_ready
+    if _child_watcher_ready:
+        return
+    try:
+        existing = asyncio.get_event_loop_policy().get_child_watcher()
+        if existing is not None:
+            _child_watcher_ready = True
+            return
+    except Exception:
+        pass
+    watcher = asyncio.ThreadedChildWatcher()
+    try:
+        watcher.attach_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
+    pol = asyncio.get_event_loop_policy()
+    try:
+        pol.set_child_watcher(watcher)
+    except Exception:
+        pass
+    # Belt-and-suspenders: ensure events.get_child_watcher() returns a working
+    # watcher even if the policy doesn't support set_child_watcher.
+    try:
+        pol.get_child_watcher = lambda: watcher  # type: ignore[method-assign]
+    except Exception:
+        pass
+    _child_watcher_ready = True
+
 
 def _get_env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
@@ -586,6 +625,12 @@ async def create_local_process_env(local_cfg: Dict[str, Any]) -> LocalProcessWeb
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"env_server_{port_lease.port}_{int(time.time() * 1000)}.log")
         log_file = open(log_path, "ab", buffering=0)
+
+        # Inside Ray rollout actors the event loop runs on a non-main thread whose
+        # active policy has no asyncio child watcher, so create_subprocess_exec
+        # raises NotImplementedError. Install a ThreadedChildWatcher (works from
+        # any thread) and make the policy return it, so subprocess spawning works.
+        _ensure_asyncio_child_watcher()
 
         proc = await asyncio.create_subprocess_exec(
             python_bin,

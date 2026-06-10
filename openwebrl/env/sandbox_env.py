@@ -30,7 +30,15 @@ _SANDBOX_CLIENT_DIR = os.path.abspath(
 if _SANDBOX_CLIENT_DIR not in sys.path:
     sys.path.insert(0, _SANDBOX_CLIENT_DIR)
 
-from client.sandbox_client import AsyncSandboxClient, AsyncSandboxInstance
+try:
+    from client.sandbox_client import AsyncSandboxClient, AsyncSandboxInstance
+except ModuleNotFoundError:
+    # The Orchard sandbox client is only required for sandbox mode. In
+    # local_process mode (or any environment where it isn't installed) the
+    # module must still import so utilities like `--cleanup` can run and
+    # no-op gracefully instead of crashing with ModuleNotFoundError.
+    AsyncSandboxClient = None
+    AsyncSandboxInstance = None
 
 # ---------------------------------------------------------------------------
 # Constants
