@@ -42,8 +42,8 @@ MODEL_NAME="OpenWebRL/OpenWebRL-4B-SFT"
 
 MODEL_ROOT="${SLIME_MODEL_ROOT:-${REPO_ROOT}/models}"
 SAVE_ROOT="${SLIME_SAVE_ROOT:-${REPO_ROOT}/outputs}"
-# DEFAULT_SAVE_DIR="${SAVE_ROOT}/qwen3-vl-8b-thinking_browser_rl_turn_bs48_0329_gpt4.1reward_maxstep20_img1_fixbs256_ppoepoch2_fixmultimodalinput_${RUN_TIMESTAMP}_no-0.1_fixactions_temperature0.8_fromSFT912_epoch3_trainstep30fromckpt59"
-DEFAULT_SAVE_DIR="${SAVE_ROOT}/qwen3-vl-8b-thinking_browser_rl_turn_bs48_0329_gpt4.1reward_maxstep20_img1_fixbs256_ppoepoch2_fixmultimodalinput_${RUN_TIMESTAMP}_no-0.1_fixactions_temperature0.8_fromSFT912_epoch3_trainstep30fromckpt59_lr5e-7"
+# DEFAULT_SAVE_DIR="${SAVE_ROOT}/qwen3-vl-4b-thinking_browser_rl_turn_bs48_0329_gpt4.1reward_maxstep20_img1_fixbs256_ppoepoch2_fixmultimodalinput_${RUN_TIMESTAMP}_no-0.1_fixactions_temperature0.8_fromSFT912_epoch3_trainstep30fromckpt59"
+DEFAULT_SAVE_DIR="${SAVE_ROOT}/qwen3-vl-4b-thinking_browser_rl_turn_bs48_0329_gpt4.1reward_maxstep20_img1_fixbs256_ppoepoch2_fixmultimodalinput_${RUN_TIMESTAMP}_no-0.1_fixactions_temperature0.8_fromSFT912_epoch3_trainstep30fromckpt59_lr5e-7"
 # DEFAULT_SAVE_DIR="${SAVE_ROOT}/qwen3-vl-4b-thinking_browser_rl_turn_bs48_0329_gpt4.1reward_maxstep15_img1_fixbs256_ppoepoch2_fixmultimodalinput_${RUN_TIMESTAMP}_no-0.1_fixactions_temperature0.8_frombase_notoolresponse"
 # Resume from:
 #   ${SLIME_LOAD_CHECKPOINT}/iter_0000024
@@ -515,9 +515,9 @@ MISC_ARGS=(
 # 6. Launch
 # ==============================================================================
 
-# Megatron model type: Qwen3-VL-4B-Instruct → qwen3-4B
-# MEGATRON_MODEL_TYPE="qwen3-4B"
-MEGATRON_MODEL_TYPE="qwen3-8B"
+# Megatron model type: Qwen3-VL-4B (OpenWebRL-4B-SFT) → qwen3-4B
+# (hidden 2560 / ffn 9728 / 36 layers / tied embeddings — matches qwen3-4B.sh)
+MEGATRON_MODEL_TYPE="qwen3-4B"
 export MODEL_ARGS_ROTARY_BASE=5000000
 
 # Source the megatron model definition to get ${MODEL_ARGS[@]}
