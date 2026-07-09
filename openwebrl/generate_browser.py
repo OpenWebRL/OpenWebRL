@@ -59,6 +59,7 @@ from slime.rollout.sglang_rollout import GenerateState
 _BROWSER_DIR = os.path.dirname(os.path.abspath(__file__))
 _EXPT_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 _SANDBOX_CLEANUP_DONE = False
+_BROWSER_USE_CLEANUP_DONE = False
 _BROWSER_ROLLOUT_GATE: asyncio.Semaphore | None = None
 _BROWSER_ROLLOUT_GATE_LIMIT: int | None = None
 _BROWSER_ROLLOUT_GATE_LOCK = asyncio.Lock()
@@ -214,7 +215,7 @@ def _append_host_to_blacklist_if_needed(error_text: str) -> None:
         if not trailing_newline:
             f.write("\n")
         f.write(f"{host}\n")
-    logger.warning("Added host to browser blacklist after init failure: %s", host)
+    logger.warning(f"Added host to browser blacklist after init failure: {host}")
 
 
 def _get_browser_rollout_concurrency(args: Any) -> int:
@@ -616,7 +617,7 @@ def _try_load_task_from_jsonl(task_id: str, task_metadata: dict[str, Any] | None
         for candidate in candidates:
             record = by_id.get(candidate)
             if record is not None:
-                logger.info("Loaded task %s from JSONL %s using key %s", task_id, path, candidate)
+                logger.info(f"Loaded task {task_id} from JSONL {path} using key {candidate}")
                 return _task_record_to_task_data(record, task_id)
 
     # Fallback for datasets that still use webvoyager/<numeric_id> while tasks are stored
@@ -681,7 +682,7 @@ def _load_local_resources(
     else:
         task_data = _try_load_task_from_jsonl(task_id, task_metadata)
         if task_data is None:
-            logger.warning("Task %s not found locally, falling back to sample metadata.", task_id)
+            logger.warning(f"Task {task_id} not found locally, falling back to sample metadata.")
             task_data = _build_fallback_task_data(task_id, task_metadata)
 
     return task_data, tool_list, policy
@@ -692,10 +693,10 @@ def _apply_browser_env_mode_override(env_config: BrowserEnvConfig) -> BrowserEnv
     mode = os.environ.get("SLIME_BROWSER_ENV_MODE")
     if mode in (None, ""):
         return env_config
-    if mode not in {"local_process", "sandbox"}:
+    if mode not in {"local_process", "sandbox", "browser-use"}:
         raise ValueError(
             "Unsupported SLIME_BROWSER_ENV_MODE="
-            f"{mode!r}; expected one of local_process, sandbox."
+            f"{mode!r}; expected one of local_process, sandbox, browser-use."
         )
     merged_config = dict(env_config)
     merged_config["mode"] = mode
@@ -781,6 +782,7 @@ async def _create_env(
 
     - ``"sandbox"``: K8s sandbox pods via orchestrator + exec/curl
     - ``"local_process"``: local env_server subprocess + HTTP
+    - ``"browser-use"``: drive a remote browser on cloud.browser-use.com via CDP
 
     All config/task/policy data is loaded from the local filesystem and,
     in server-backed modes, sent to the env_server via the /reset request.
@@ -837,6 +839,47 @@ async def _create_env(
 
         return env, task_data
 
+    # ---- Browser-Use mode: create a fresh remote browser session per environment ----
+    if mode == "browser-use":
+        browser_use_cfg = env_config.get("browser_use", {}) or {}
+
+        from openwebrl.env.browser_use_env import (
+            create_browser_use_env,
+            cleanup_existing_browser_use_sessions,
+        )
+
+        # On first session creation, stop any leftover remote sessions from a
+        # previous run that was aborted (e.g. Ctrl+C). Browser-Use sessions bill
+        # by the minute, so this sweep avoids charges until the server-side
+        # timeout kicks in.
+        global _BROWSER_USE_CLEANUP_DONE
+        if not _BROWSER_USE_CLEANUP_DONE:
+            await cleanup_existing_browser_use_sessions(browser_use_cfg)
+            _BROWSER_USE_CLEANUP_DONE = True
+
+        env = None
+        try:
+            env = await create_browser_use_env(
+                browser_use_cfg=browser_use_cfg,
+                env_config=env_config,
+                tool_list=tool_list,
+                policy=policy,
+                start_url=task_data["start_url"],
+            )
+        except BaseException:
+            if env is not None:
+                try:
+                    await env.exit()
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Task %s: failed to clean up browser-use env during initialization: %s",
+                        task_id,
+                        cleanup_exc,
+                    )
+            raise
+
+        return env, task_data
+
     # ---- Local-process mode: fresh local env_server subprocess per environment ----
     if mode == "local_process":
         local_cfg = env_config.get("local_process", {})
@@ -867,7 +910,7 @@ async def _create_env(
 
         return env, task_data
 
-    raise ValueError(f"Unsupported browser env mode={mode!r}; expected one of sandbox, local_process.")
+    raise ValueError(f"Unsupported browser env mode={mode!r}; expected one of sandbox, local_process, browser-use.")
 
 async def _initialize_resources(args: Any, task_id: str, task_metadata: dict[str, Any] | None = None):
     """Initialize adapter, generate state, and server URL."""
@@ -1339,7 +1382,7 @@ async def _generate_trajectory_sample_impl(
     task_id = (sample.metadata or {}).get("task_id", "webvoyager/60")
     sample_id = task_id.replace('/', '_')
     if _should_log_task_start(args):
-        logger.info("Generating trajectory for sample: %s", task_id)
+        logger.info(f"Generating trajectory for sample: {task_id}")
 
     mm_messages: list[dict] = []  # initialized early so finally block can always access it
     env = None  # initialized early so finally block can always clean up
@@ -1454,7 +1497,7 @@ async def _generate_trajectory_sample_impl(
             )
             # --------------------------------------------------------------
             if _should_sample_llm_output(args):
-                logger.info("Task %s step %d llm_response=%r", task_id, step, llm_response)
+                logger.info(f"Task {task_id} step {step} llm_response={llm_response!r}")
 
             # 7. Append LLM response tokens (loss_mask=1)
             cat_all_msgs += llm_response
@@ -1545,6 +1588,11 @@ async def _generate_trajectory_sample_impl(
         sample.response_length = len(sample.loss_mask)
         sample.multimodal_inputs = {"images": all_imgs}
         # sample.multimodal_inputs = {"images": all_pil_imgs}
+        # Snapshot the trajectory for the eval judges (see the turn-level path):
+        # online_mind2web / webvoyager / deepshop read metadata["messages"] and
+        # metadata["full_image_list"].
+        sample.metadata["messages"] = list(mm_messages)
+        sample.metadata["full_image_list"] = list(all_imgs)
         sample.multimodal_train_inputs = _merge_multimodal_train_inputs(multimodal_train_inputs_buffer)
         _ensure_correct_sample(sample, tokenizer) # for debugging: verify final token stream is correct after merging multimodal inputs
 
@@ -1646,7 +1694,7 @@ async def _generate_turn_sample_impl(
     task_id = (sample.metadata or {}).get("task_id", "webvoyager/60")
     sample_id = task_id.replace('/', '_')
     if _should_log_task_start(args):
-        logger.info("Generating turn data for sample: %s", task_id)
+        logger.info(f"Generating turn data for sample: {task_id}")
 
     mm_messages: list[dict] = []
     turn_samples: list[Sample] = []
@@ -1782,7 +1830,7 @@ async def _generate_turn_sample_impl(
             )
             # --------------------------------------------------------------
             if _should_sample_llm_output(args):
-                logger.info("Task %s step %d llm_response=%r", task_id, step, llm_response[:1000])
+                logger.info(f"Task {task_id} step {step} llm_response={llm_response[:1000]!r}")
 
             # 8. Append LLM response tokens (loss_mask=1)
             _append_to_sample(turn_sample, new_tokens, new_logprobs, loss_mask_val=1)
@@ -1800,6 +1848,13 @@ async def _generate_turn_sample_impl(
                 response_mode,
             )
             mm_messages.append({"role": "assistant", "content": assistant_history_text})
+
+            # Snapshot the full conversation + screenshots onto the turn sample so
+            # the eval judges (online_mind2web / webvoyager / deepshop) can read the
+            # trajectory via metadata["messages"] / ["full_image_list"]. Whichever
+            # turn ends up last then carries the complete trajectory.
+            turn_sample.metadata["messages"] = list(mm_messages)
+            turn_sample.metadata["full_image_list"] = list(img_list)
 
             # 9. Check if generation should stop (from the SGLang side)
             if finish_type == "length":

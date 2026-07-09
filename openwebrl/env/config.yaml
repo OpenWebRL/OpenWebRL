@@ -1,6 +1,7 @@
-# Environment mode: "local_process" or "sandbox"
+# Environment mode: "local_process", "sandbox", or "browser-use"
 # - local_process: create one local env_server subprocess/process group per env
 # - sandbox: create K8s sandbox pods via orchestrator + exec/curl
+# - browser-use: drive a remote browser hosted on cloud.browser-use.com via CDP
 mode: sandbox
 
 # Sandbox-specific config (used when mode: sandbox).
@@ -18,6 +19,15 @@ sandbox:
   max_retries: 10               # max retry attempts for sandbox client requests
   retry_delay: 5                # initial backoff delay in seconds (exponential: 5s, 10s, 20s, ...)
   log_successful_requests: false # false: suppress per-request /reset,/step,/exit OK diagnostics in rollout logs
+
+# Browser-Use-specific config (used when mode: browser-use).
+# A fresh remote browser session is created per generation and stopped on env.exit().
+# API key can be overridden by the BROWSER_USE_API_KEY env var.
+browser_use:
+  api_key: ""                   # BROWSER_USE_API_KEY
+  timeout: 10                   # session timeout in minutes (free: <=15, paid: <=240)
+  profile_id: null              # optional Browser-Use profile id
+  proxy_country_code: null      # optional proxy country code (e.g. "us", "de"); null disables the proxy
 
 # Local subprocess-specific config (used when mode: local_process).
 # A fresh local env_server subprocess is created for each generation and

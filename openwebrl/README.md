@@ -22,14 +22,15 @@ The root [README.md](../README.md) is the main project entry point. This documen
 
 ## Supported Runtime Modes
 
-`generate_browser.py` currently supports two modes. You can set them in `openwebrl/env/config.yaml` or override with `SLIME_BROWSER_ENV_MODE`.
+`generate_browser.py` currently supports three modes. You can set them in `openwebrl/env/config.yaml` or override with `SLIME_BROWSER_ENV_MODE`.
 
 | Mode | Description | Typical Use |
 |---|---|---|
 | `local_process` | Starts local `openwebrl.docker.env_server` subprocesses and talks to them over HTTP. | Local smoke tests and small evaluations. |
 | `sandbox` | Creates fresh sandbox pods through the sandbox orchestrator ([Orchard](https://github.com/microsoft/Orchard)), starts `env_server` inside each pod, and deletes pods on exit. | Scalable training and evaluation. |
+| `browser-use` | Creates a fresh remote browser session on [cloud.browser-use.com](https://cloud.browser-use.com) per environment and drives it via CDP. Requires the `browser_use_sdk` package and `BROWSER_USE_API_KEY`. | Running against a hosted browser without a sandbox cluster. |
 
-The Docker server can also be run directly for validating the browser image and HTTP API. The training/evaluation launchers use `local_process` or `sandbox`.
+The Docker server can also be run directly for validating the browser image and HTTP API. The training/evaluation launchers use `local_process`, `sandbox`, or `browser-use`.
 
 ## Required Environment
 
@@ -48,6 +49,12 @@ Sandbox mode additionally requires:
 export SANDBOX_ORCHESTRATOR_URL=http://<orchestrator-host>
 export SANDBOX_API_KEY=<optional-api-key>
 export BROWSER_SANDBOX_IMAGE=<registry-or-local-image>/browser-env:latest
+```
+
+Browser-Use mode additionally requires the `browser_use_sdk` package and an API key:
+
+```bash
+export BROWSER_USE_API_KEY=<your-browser-use-api-key>
 ```
 
 Do not commit real orchestrator URLs, tokens, API keys, or private registry names. Keep them in environment variables or your cluster secret manager.
@@ -152,12 +159,15 @@ Important fields:
 
 | Field | Meaning |
 |---|---|
-| `mode` | `local_process` or `sandbox`. Can be overridden by `SLIME_BROWSER_ENV_MODE`. |
+| `mode` | `local_process`, `sandbox`, or `browser-use`. Can be overridden by `SLIME_BROWSER_ENV_MODE`. |
 | `sandbox.orchestrator_url` | Sandbox orchestrator URL. Prefer `SANDBOX_ORCHESTRATOR_URL`. |
 | `sandbox.api_key` | Sandbox API key. Prefer `SANDBOX_API_KEY`. |
 | `sandbox.image` | Browser image. Prefer `BROWSER_SANDBOX_IMAGE`. |
 | `sandbox.max_sandboxes` | Maximum concurrent sandbox environments in one rollout process. |
 | `local_process.port_start` / `port_end` | Port range for local env servers. |
+| `browser_use.api_key` | Browser-Use API key. Prefer `BROWSER_USE_API_KEY`. |
+| `browser_use.timeout` | Remote session timeout in minutes (free: ≤15, paid: ≤240). |
+| `browser_use.profile_id` / `proxy_country_code` | Optional Browser-Use profile and proxy country. |
 | `path_to_policy` | Browser system prompt path. |
 | `path_to_tool_list` | Browser tool schema path. |
 | `path_to_task_file` | Default task file. |

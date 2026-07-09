@@ -193,7 +193,7 @@ local/
 /core
 /eval/
 /openwebrl/.git/
-/openwebrl/eval/
+# /openwebrl/eval/
 /openwebrl/env/.env
 /openwebrl/env/.auth/
 /openwebrl/__pycache__/
