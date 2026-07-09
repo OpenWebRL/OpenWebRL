@@ -55,9 +55,13 @@ def _hf_validate_args(args, hf_config):
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+        # Megatron exposes the RMSNorm/LayerNorm epsilon as ``layernorm_epsilon``
+        # (CLI ``--norm-epsilon``); older builds used ``norm_epsilon``. Keep both
+        # and guard on hasattr so a missing attribute is skipped, not fatal.
         ("rms_norm_eps", "norm_epsilon", equal),
+        ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:
-        if hasattr(hf_config, hf_config_name):
+        if hasattr(hf_config, hf_config_name) and hasattr(args, megatron_config_name):
             if not compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)):
                 errors.append(
                     f"{hf_config_name} in hf config {getattr(hf_config, hf_config_name)} is not equal to "
