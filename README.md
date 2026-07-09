@@ -23,7 +23,9 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
 
 ## 📋 TODO
 
-- [x] Support SFT with Qwen3.5
+- [x] Supported [SFT](sft/README.md) with Qwen3.5 (2026.06.06)
+- [x] Supported [browser-use env](openwebrl/env/browser_use_env.py) for interaction (2026.07.08)
+- [x] Update [evaluation script](scripts/run_evaluation.sh) for [WebVoyager](openwebrl/eval/reward_webvoyager.py), [Online-Mind2Web](openwebrl/eval/reward_online_mind2web.py), and [Deepshop](openwebrl/eval/reward_deepshop.py). (2026.07.08)
 - [ ] Support RL with Qwen3.5
 - [ ] Release demo
 
@@ -102,13 +104,14 @@ bash set_up.sh
 pip install -e .
 ```
 
-The browser environment can run in two modes configured in
+The browser environment can run in three modes configured in
 [`openwebrl/env/config.yaml`](openwebrl/env/config.yaml):
 
 | Mode | Description |
 |---|---|
 | `local_process` | Starts local `env_server.py` subprocesses on this machine. Useful for debugging and small evaluation runs. |
 | `sandbox` | Uses [Orchard Env](https://github.com/microsoft/Orchard) to create isolated browser pods for large-scale parallel rollout. |
+| `browser-use` | Drives a remote browser hosted on [cloud.browser-use.com](https://cloud.browser-use.com) via CDP. Requires `BROWSER_USE_API_KEY` and the `browser_use_sdk` package. |
 
 We recommend sandbox mode for large-scale rollouts. OpenWebRL integrates with [Orchard](https://github.com/microsoft/Orchard), an open-source Kubernetes-native sandbox framework that provides per-episode network isolation and scales to hundreds of concurrent browser instances. Isolation significantly reduces the rate at which real websites block agent traffic — in our Online-Mind2Web evaluation without browser base service, the block rate dropped from **25.7% (local process) to 17.7% (Orchard sandbox)**. This advantage is amplified during online RL, where GRPO-style group rollouts repeatedly query the same site within a single training step, making per-site rate limiting a much more severe bottleneck.
 
@@ -149,10 +152,11 @@ Browser environment:
 
 | Variable | Description |
 |---|---|
-| `SLIME_BROWSER_ENV_MODE` | `sandbox` or `local_process`. |
+| `SLIME_BROWSER_ENV_MODE` | `sandbox`, `local_process`, or `browser-use`. |
 | `BROWSER_SANDBOX_IMAGE` | Browser container image for sandbox mode. |
 | `SANDBOX_ORCHESTRATOR_URL` | Sandbox orchestrator URL for sandbox mode. |
 | `SANDBOX_API_KEY` | Sandbox orchestrator API key. |
+| `BROWSER_USE_API_KEY` | [Browser-Use](https://cloud.browser-use.com) API key (only for `browser-use` mode). |
 
 Judge / reward:
 

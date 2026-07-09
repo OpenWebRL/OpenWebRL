@@ -4,6 +4,12 @@ set -ex
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Load credentials/settings (JUDGE_*/AZURE_TOKEN_PATH/SANDBOX_*/BROWSER_USE_API_KEY)
+# into this session so run_evaluate.py inherits them.
+if [ -f "${REPO_ROOT}/.env" ]; then
+    source "${REPO_ROOT}/.env"
+fi
+
 export SLIME_BROWSER_SANDBOX_MANIFEST_DIR=/tmp/slime_browser_sandboxes_eval
 echo "SLIME_BROWSER_SANDBOX_MANIFEST_DIR=${SLIME_BROWSER_SANDBOX_MANIFEST_DIR}"
 
@@ -15,7 +21,10 @@ model_list_dir="${MODEL_LIST_DIR_DEFAULT:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-eval_onlinemind2web/gpt4.1-judge-prompt-acthistory_SFT_1images_addenvfeedback_modebrowser_eval1image_trainmaxstep15_evalstep30_fromsftepoch3_ppoepoch1}"
 # OUTPUT_ROOT="${OUTPUT_ROOT:-eval_onlinemind2web/gpt4.1-judge-prompt-acthistory_SFT_1images_addenvfeedback_modebrowser_eval1image_trainmaxstep30_evalstep30_fromrl15stepsckpt84_sftepoch3}"
 mkdir -p "${OUTPUT_ROOT}"
-task_file="${TASK_FILE:-openwebrl/data/online-mind2web.jsonl}"
+task_file="${TASK_FILE:-openwebrl/data/eval/online-mind2web.jsonl}"
+# Eval judge protocol: browser | webvoyager | online_mind2web | deepshop
+# (should match the benchmark in task_file).
+EVAL_PROTOCOL="${EVAL_PROTOCOL:-online_mind2web}"
 
 BROWSER_RESPONSE_FORMAT_MODE="${BROWSER_RESPONSE_FORMAT_MODE:-browser_env}" # slime
 BROWSER_INCLUDE_TOOL_RESPONSE="${BROWSER_INCLUDE_TOOL_RESPONSE:-1}" ###################################tool response
@@ -27,7 +36,7 @@ TURN_HISTORY_REASONING_MODE="${TURN_HISTORY_REASONING_MODE:-full}" # full
 
 
 
-MODEL_LIST_OVERRIDE="${MODEL_LIST_OVERRIDE:-}"
+MODEL_LIST_OVERRIDE="${MODEL_LIST_OVERRIDE:-/data/users/qianhuiwu/openwebrl_outputs/qwen3-vl-8b-thinking_browser_rl_turn_bs48_0329_gpt4.1reward_maxstep20_img1_fixbs256_ppoepoch2_fixmultimodalinput_20260705_061604_no-0.1_fixactions_temperature0.8_fromSFT912_epoch3_trainstep30fromckpt59_lr5e-7_hf/iter_0000054}"
 MODEL_LIST_DIR="${MODEL_LIST_DIR:-${model_list_dir}}"
 if [ -z "${MODEL_LIST_OVERRIDE}" ] && [ -z "${MODEL_LIST_DIR}" ]; then
     echo "ERROR: set MODEL_LIST_DIR or MODEL_LIST_OVERRIDE to the converted checkpoint(s) to evaluate."
@@ -47,7 +56,10 @@ SGLANG_STARTUP_TIMEOUT_SECS="${SGLANG_STARTUP_TIMEOUT_SECS:-600}"
 SGLANG_VENV_ACTIVATE="${SGLANG_VENV_ACTIVATE:-}"
 # SGLANG_PYTHON_BIN="${SGLANG_PYTHON_BIN:-/root/.venv_sglang/bin/python}"
 
-JUDGE_MODEL="${JUDGE_MODEL:-gpt-4.1}"
+# Leave JUDGE_MODEL empty to use each protocol's canonical judge
+# (webvoyager/deepshop=gpt-4o, online_mind2web=o4-mini, browser=gpt-4.1);
+# set it (e.g. JUDGE_MODEL=gpt-4.1) to force one judge model across all protocols.
+JUDGE_MODEL="${JUDGE_MODEL:-}"
 JUDGE_API_MODE="${JUDGE_API_MODE:-token}" 
 # JUDGE_API_MODE="${JUDGE_API_MODE:-served}" # token, served, api_key
 JUDGE_API_HOST="${JUDGE_API_HOST:-}"
@@ -66,7 +78,8 @@ export SLIME_BROWSER_SANDBOX_ACQUIRE_TIMEOUT_SECS="${SLIME_BROWSER_SANDBOX_ACQUI
 
 echo "SANDBOX_MAX_SANDBOXES=${SLIME_BROWSER_SANDBOX_MAX_SANDBOXES}"
 echo "SANDBOX_ACQUIRE_TIMEOUT_SECS=${SLIME_BROWSER_SANDBOX_ACQUIRE_TIMEOUT_SECS}"
-echo "JUDGE_MODEL=${JUDGE_MODEL}"
+echo "EVAL_PROTOCOL=${EVAL_PROTOCOL}"
+echo "JUDGE_MODEL=${JUDGE_MODEL:-<per-protocol default>}"
 echo "JUDGE_API_MODE=${JUDGE_API_MODE}"
 echo "JUDGE_API_BASE=${JUDGE_API_BASE}"
 echo "JUDGE_API_HOST=${JUDGE_API_HOST}"
@@ -156,7 +169,7 @@ start_sglang_server() {
         launch_cmd="exec ${python_bin} -m sglang.launch_server"
     fi
 
-    launch_cmd="${launch_cmd} --model-path \"${current_model_name}\" --host \"${SGLANG_SERVER_HOST}\" --port \"${SGLANG_PORT}\" --trust-remote-code --dtype \"${SGLANG_DTYPE}\" --mem-fraction-static \"${SGLANG_MEM_FRACTION_STATIC}\" --context-length \"${SGLANG_CONTEXT_LENGTH}\" --tp \"${SGLANG_TP}\" --dp \"${SGLANG_DP}\""
+    launch_cmd="${launch_cmd} --model-path \"${current_model_name}\" --host \"${SGLANG_SERVER_HOST}\" --port \"${SGLANG_PORT}\" --trust-remote-code --dtype \"${SGLANG_DTYPE}\" --mem-fraction-static \"${SGLANG_MEM_FRACTION_STATIC}\" --context-length \"${SGLANG_CONTEXT_LENGTH}\" --tp \"${SGLANG_TP}\" --dp \"${SGLANG_DP}\" --attention-backend flashinfer --mm-attention-backend triton_attn "
 
     echo "Starting sglang server for model_name=${current_model_name}"
     setsid bash -lc "${launch_cmd}" > "${SGLANG_SERVER_LOG}" 2>&1 &
@@ -189,14 +202,23 @@ run_eval_for_model() {
 
     echo "Evaluating model_name=${current_model_name}"
     start_sglang_server "${current_model_name}" "${model_tag}"
+
+    # Only pass --judge-model when explicitly set, so the protocol's canonical
+    # judge default applies otherwise.
+    local judge_model_arg=()
+    if [ -n "${JUDGE_MODEL}" ]; then
+        judge_model_arg=(--judge-model "${JUDGE_MODEL}")
+    fi
+
     python openwebrl/run_evaluate.py --task-file  ${task_file} \
+            --eval-protocol "${EVAL_PROTOCOL}" \
             --hf-checkpoint "${current_model_name}" \
             --output "${OUTPUT_ROOT}/${model_tag}" \
             --n-parallel "${SLIME_BROWSER_SANDBOX_MAX_SANDBOXES}" \
             --sglang-ip "${ip}" --sglang-port "${port}" \
             --context-num-screenshots "${CONTEXT_NUM_SCREENSHOTS}" \
             --judge-max-attached-imgs "${JUDGE_MAX_ATTACHED_IMGS}" \
-            --judge-model "${JUDGE_MODEL}" \
+            "${judge_model_arg[@]}" \
             --judge-api-mode "${JUDGE_API_MODE}" \
             --judge-prompt-variant "${JUDGE_PROMPT_VARIANT}" \
             --turn-history-reasoning-mode "${TURN_HISTORY_REASONING_MODE}" \

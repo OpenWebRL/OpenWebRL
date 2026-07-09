@@ -34,6 +34,32 @@ from openwebrl.reward_browser import reward_func
 from slime.utils.types import Sample
 from slime.utils.http_utils import init_http_client
 
+
+def _load_reward_func(protocol: str):
+    """Select the eval-time reward/judge protocol.
+
+    - ``browser`` (default): the generic VLM-judge reward used for training.
+    - ``webvoyager``: FARA-style pure judge (WebVoyager).
+    - ``online_mind2web``: FARA AgentTrek single-call judge (Online-Mind2Web).
+    - ``deepshop``: structured-output judge (DeepShop).
+    """
+    protocol = (protocol or "browser").lower()
+    if protocol in ("browser", "default"):
+        from openwebrl.reward_browser import reward_func as f
+    elif protocol == "webvoyager":
+        from openwebrl.eval.reward_webvoyager import reward_func as f
+    elif protocol == "online_mind2web":
+        from openwebrl.eval.reward_online_mind2web import reward_func as f
+    elif protocol == "deepshop":
+        from openwebrl.eval.reward_deepshop import reward_func as f
+    else:
+        raise ValueError(
+            f"Unsupported --eval-protocol {protocol!r}; expected one of "
+            "browser, webvoyager, online_mind2web, deepshop."
+        )
+    return f
+
+
 try:
     from tqdm.auto import tqdm
 except ImportError:
@@ -406,8 +432,8 @@ def main():
                         help="Output JSONL path (default: auto-generated with timestamp)")
     parser.add_argument("--context-num-screenshots", type=int, default=3,
                         help="Number of latest screenshots kept in turn-level context.")
-    parser.add_argument("--judge-max-attached-imgs", type=int, default=3,
-                        help="Maximum number of screenshots attached to the judge prompt.")
+    parser.add_argument("--judge-max-attached-imgs", type=int, default=None,
+                        help="Max screenshots attached to the judge prompt. Unset => per-protocol default (30 for webvoyager/deepshop, else 3).")
     parser.add_argument(
         "--turn-history-reasoning-mode",
         type=str,
@@ -429,7 +455,8 @@ def main():
         choices=[0, 1],
         help="Whether to include environment feedback as <tool_response> in the next rollout input.",
     )
-    parser.add_argument("--judge-model", type=str, default="gpt-4.1")
+    parser.add_argument("--judge-model", type=str, default=None,
+                        help="Judge model. Unset => per-protocol canonical judge (webvoyager/deepshop=gpt-4o, online_mind2web=o4-mini, else gpt-4.1).")
     parser.add_argument(
         "--judge-api-mode",
         type=str,
@@ -446,6 +473,9 @@ def main():
     )
     parser.add_argument("--judge-timeout-secs", type=float, default=30.0,
                         help="Timeout in seconds for a single judge API call. <=0 disables the timeout.")
+    parser.add_argument("--eval-protocol", type=str, default="browser",
+                        choices=["browser", "webvoyager", "online_mind2web", "deepshop"],
+                        help="Eval judge protocol: browser (default VLM judge), webvoyager, online_mind2web, or deepshop.")
     parser.add_argument("--task-indices", type=str, default="",
                         help="Comma-separated task indices to evaluate (e.g. '0,5,10'). Empty = all.")
     parser.add_argument("--turn-level", action="store_true", help="Whether to run turn-level evaluation instead of task-level.")
@@ -455,8 +485,29 @@ def main():
                         help="Timeout in seconds for a whole task evaluation. <=0 disables the timeout.")
     args = parser.parse_args()
 
+    # Select the eval-time judge protocol (rebinds the module-level reward_func
+    # used by evaluate_single_task).
+    global reward_func
+    reward_func = _load_reward_func(args.eval_protocol)
+
+    # Each benchmark has a canonical judge (WebVoyager/DeepShop=gpt-4o w/ 30 imgs,
+    # Online-Mind2Web=o4-mini) applied as a DEFAULT; an explicit --judge-model /
+    # --judge-max-attached-imgs on the command line still wins.
+    _protocol_judge_defaults = {
+        "webvoyager": {"judge_api_model": "gpt-4o", "judge_max_attached_imgs": 30},
+        "online_mind2web": {"judge_api_model": "o4-mini"},
+        "deepshop": {"judge_api_model": "gpt-4o", "judge_max_attached_imgs": 30},
+    }
+    _proto = _protocol_judge_defaults.get(args.eval_protocol, {})
+    judge_model = args.judge_model if args.judge_model is not None else _proto.get("judge_api_model", "gpt-4.1")
+    judge_max_attached_imgs = (
+        args.judge_max_attached_imgs if args.judge_max_attached_imgs is not None
+        else _proto.get("judge_max_attached_imgs", 3)
+    )
+    print(f"Judge: model={judge_model}, max_attached_imgs={judge_max_attached_imgs} (protocol={args.eval_protocol})")
+
     checkpoint_tag = _short_checkpoint_tag(args.hf_checkpoint)
-    judge_tag = os.path.basename(os.path.normpath(args.judge_model))
+    judge_tag = os.path.basename(os.path.normpath(judge_model))
     expt_name = f"eval_{checkpoint_tag}_{judge_tag}_{'turn' if args.turn_level else 'trajectory'}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
     args.output = os.path.join(args.output, expt_name)
     os.makedirs(args.output, exist_ok=True)
@@ -468,8 +519,8 @@ def main():
         hf_checkpoint=args.hf_checkpoint,
         max_steps=args.max_steps,
         context_num_screenshots=args.context_num_screenshots,
-        judge_max_attached_imgs=args.judge_max_attached_imgs,
-        judge_api_model=args.judge_model,
+        judge_max_attached_imgs=judge_max_attached_imgs,
+        judge_api_model=judge_model,
         judge_api_mode=args.judge_api_mode,
         judge_prompt_variant=args.judge_prompt_variant,
         turn_history_reasoning_mode=args.turn_history_reasoning_mode,
@@ -501,6 +552,8 @@ def main():
         indices = set(int(x) for x in args.task_indices.split(","))
         tasks = [t for t in tasks if t["index"] in indices]
         print(f"Filtered to {len(tasks)} tasks: {[t['task_id'] for t in tasks]}")
+
+    print(f"Evaluating {len(tasks)} tasks (protocol={args.eval_protocol}, ")
 
     # Run evaluation
     results, abnormal_results = asyncio.run(
