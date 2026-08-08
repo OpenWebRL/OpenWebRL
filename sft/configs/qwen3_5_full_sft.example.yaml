@@ -6,8 +6,8 @@
 
 ### model
 model_name_or_path: Qwen/Qwen3.5-9B
-image_max_pixels: 262144
-video_max_pixels: 16384
+image_max_pixels: 12845056
+video_max_pixels: 12845056
 trust_remote_code: true
 
 ### method
