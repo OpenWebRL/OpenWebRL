@@ -14,3 +14,10 @@ scripts are standalone evaluation helpers:
 - `single_file_openai_judge_inference.py`: API judge inference over JSON/JSONL judge inputs.
 
 Set `VAL_DATA` to your judge-evaluation JSONL before running the shell scripts.
+
+## Updates
+
+- 2026.08.17: Fixed native judge verdict parsing in
+  `single_file_judge_inference.py` to prioritize the final explicit verdict
+  marker (`Verdict`, `Final Verdict`, or `Definitive Verdict`) instead of the
+  first verdict-like phrase in the reasoning text.
