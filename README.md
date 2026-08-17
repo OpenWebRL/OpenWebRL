@@ -27,7 +27,7 @@ rollouts, tool-call parsing, textual environment feedback, VLM-as-a-judge reward
 - [x] Supported [browser-use env](openwebrl/env/browser_use_env.py) for interaction (2026.07.08)
 - [x] Update [evaluation script](scripts/run_evaluation.sh) for [WebVoyager](openwebrl/eval/reward_webvoyager.py), [Online-Mind2Web](openwebrl/eval/reward_online_mind2web.py), and [Deepshop](openwebrl/eval/reward_deepshop.py). (2026.07.08)
 - [x] Support [RL with Qwen3.5](https://github.com/MSR-Orchard/slime/blob/main/examples/orchard_gui/scripts/run_browser_qwen3.5_9b.sh) (2026.08.04)
-- [x] Fixed native judge verdict parsing to use the final explicit verdict instead of the first verdict-like phrase. (2026.08.17)
+- [x] [Fixed native judge verdict parsing](https://github.com/OpenWebRL/OpenWebRL/issues/5). (2026.08.17)
 - [ ] Release demo
 
 ## 🔭 Method At A Glance
