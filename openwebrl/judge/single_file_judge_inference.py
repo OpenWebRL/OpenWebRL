@@ -45,7 +45,8 @@ from raw trajectory fields:
 }
 
 `screenshots` may also be named `images`; values may be raw base64 strings or
-data URLs. The model output is parsed for the first `SUCCESS` or `NOT SUCCESS`.
+data URLs. The model output is parsed for its final `SUCCESS` or `NOT SUCCESS`
+verdict.
 """
 
 from __future__ import annotations
@@ -138,6 +139,10 @@ JUDGE_USER_PROMPT_ACTION_HISTORY = (
 
 DATA_URL_RE = re.compile(r"^data:image/[^;]+;base64,", re.IGNORECASE)
 VERDICT_RE = re.compile(r"\b(NOT SUCCESS|SUCCESS)\b", re.IGNORECASE)
+EXPLICIT_VERDICT_RE = re.compile(
+    r"\b(?:final\s+|definitive\s+)?verdict\b[\s:*_`\-]*\b(NOT SUCCESS|SUCCESS)\b",
+    re.IGNORECASE,
+)
 WEBJUDGE_STATUS_RE = re.compile(r"\bStatus\s*:\s*[\"']?(success|failure)[\"']?", re.IGNORECASE)
 WEBJUDGE_ANY_STATUS_RE = re.compile(r"\b(success|failure)\b", re.IGNORECASE)
 
@@ -501,10 +506,15 @@ def record_messages(record: dict[str, Any]) -> list[dict[str, Any]]:
 def extract_native_verdict(text: str) -> str | None:
     if not text:
         return None
-    match = VERDICT_RE.search(text)
-    if not match:
+
+    explicit_matches = list(EXPLICIT_VERDICT_RE.finditer(text))
+    if explicit_matches:
+        return explicit_matches[-1].group(1).upper()
+
+    matches = list(VERDICT_RE.finditer(text))
+    if not matches:
         return None
-    return match.group(1).upper()
+    return matches[-1].group(1).upper()
 
 
 def extract_webjudge_verdict(text: str) -> str | None:
