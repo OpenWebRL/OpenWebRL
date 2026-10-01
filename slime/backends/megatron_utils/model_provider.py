@@ -147,6 +147,26 @@ def get_model_provider_func(
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
         if hasattr(args, "moe_token_dispatcher_type"):
             provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
+        # The provider is built from the HF config, so --attention-backend would
+        # otherwise be ignored and every model would run Megatron's "auto" choice.
+        # Qwen3.5's 256-wide heads have no cuDNN fused backward plan, so the flag has
+        # to reach the provider ("cuDNN Error: No valid execution plans built").
+        if getattr(args, "attention_backend", None) is not None:
+            provider.attention_backend = args.attention_backend
+        # Same story for activation recompute: the provider is built from the HF config,
+        # so --recompute-granularity/--recompute-method/--recompute-num-layers never
+        # reached it and every "recompute on" run trained with full activation storage.
+        for name in ("recompute_granularity", "recompute_method", "recompute_num_layers", "distribute_saved_activations"):
+            value = getattr(args, name, None)
+            if value is not None and hasattr(provider, name):
+                setattr(provider, name, value)
+        logger.info(
+            "bridge provider: recompute_granularity=%s recompute_method=%s recompute_num_layers=%s attention_backend=%s",
+            getattr(provider, "recompute_granularity", None),
+            getattr(provider, "recompute_method", None),
+            getattr(provider, "recompute_num_layers", None),
+            getattr(provider, "attention_backend", None),
+        )
 
         provider.finalize()
 

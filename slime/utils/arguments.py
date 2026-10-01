@@ -366,6 +366,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-single-wave",
+                action="store_true",
+                default=False,
+                help=(
+                    "Submit exactly rollout_batch_size prompts once and train on whatever groups survive the "
+                    "dynamic sampling filter, instead of resubmitting over_sampling_batch_size more prompts "
+                    "for every dropped group. For browser rollouts a resubmission costs a full wave of sessions."
+                ),
+            )
+            parser.add_argument(
                 "--dynamic-sampling-filter-path",
                 type=str,
                 default=None,
@@ -1568,8 +1578,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             "--judge-prompt-variant",
             type=str,
             default="default",
-            choices=["default", "action_history"],
-            help="Browser judge prompt variant.",
+            choices=["default", "action_history", "agenttrek", "molmoweb_om2w"],
+            help="Browser judge prompt variant. 'agenttrek' is the single-call om2w eval judge.",
         )
         reset_arg(
             parser,
@@ -1613,11 +1623,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             "--browser-response-format-mode",
             type=str,
             default="slime",
-            choices=["slime", "browser_env"],
+            choices=["slime", "browser_env", "molmoweb"],
             help=(
                 "Browser response format mode. "
                 "'slime' keeps the current <thinking> + <action> + <tool_call> format; "
-                "'browser_env' switches to a browser-env-style <think> + <tool_call> format."
+                "'browser_env' switches to a browser-env-style <think> + <tool_call> format; "
+                "'molmoweb' uses the computer_use tool-call schema our SFT checkpoints speak."
             ),
         )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)

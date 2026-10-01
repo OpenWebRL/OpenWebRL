@@ -479,6 +479,9 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        from slime.rollout.streaming_rollout import stop_pool
+
+        stop_pool()
         for monitor in self._health_monitors:
             monitor.stop()
         logging_utils.finish_tracking(self.args)
@@ -523,6 +526,13 @@ class RolloutManager:
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return len(self.data_source) // self.args.rollout_batch_size
+
+    def set_weight_version(self, version: int) -> None:
+        """Called by train.py after every weight sync so the streaming rollout can stamp
+        each turn with the policy version it was sampled under."""
+        from slime.rollout.streaming_rollout import set_weight_version
+
+        set_weight_version(version)
 
     def generate(self, rollout_id):
         start_time = time.time()
@@ -799,19 +809,37 @@ class RolloutManager:
                             )
                         trajectory_rewards.append(base_reward)
 
-                    rewards_tensor = torch.tensor(trajectory_rewards, dtype=torch.float)
-                    rewards_tensor = rewards_tensor - rewards_tensor.mean()
+                    # Trajectories with no reward (timeout/abort/judge failure) get zero
+                    # advantage and are excluded from the group mean/std, so a partial
+                    # group still trains without a dynamic-sampling resubmission wave.
+                    scored = [r for r in trajectory_rewards if r is not None]
+                    if len(scored) < len(trajectory_rewards):
+                        logger.warning(
+                            "group_index=%s has %s/%s trajectories without reward; assigning zero advantage",
+                            group_index,
+                            len(trajectory_rewards) - len(scored),
+                            len(trajectory_rewards),
+                        )
+                    scored_tensor = torch.tensor(scored, dtype=torch.float)
+                    if scored_tensor.numel() > 0:
+                        scored_tensor = scored_tensor - scored_tensor.mean()
                     if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                        if rewards_tensor.numel() <= 1:
+                        if scored_tensor.numel() <= 1:
                             logger.warning(
                                 "Skipping std normalization for singleton trajectory group group_index=%s num_trajectories=%s",
                                 group_index,
-                                rewards_tensor.numel(),
+                                scored_tensor.numel(),
                             )
                         else:
-                            rewards_tensor = rewards_tensor / (rewards_tensor.std() + 1e-6)
+                            scored_tensor = scored_tensor / (scored_tensor.std() + 1e-6)
+                    scored_iter = iter(scored_tensor.tolist())
+                    normalized_trajectory_rewards = [
+                        0.0 if r is None else next(scored_iter) for r in trajectory_rewards
+                    ]
 
-                    for trajectory_id, normalized_reward in zip(trajectory_ids, rewards_tensor.tolist(), strict=True):
+                    for trajectory_id, normalized_reward in zip(
+                        trajectory_ids, normalized_trajectory_rewards, strict=True
+                    ):
                         for sample in trajectory_groups[trajectory_id]:
                             normalized_rewards_by_index[id(sample)] = normalized_reward
 
@@ -1352,6 +1380,50 @@ def _resolve_sglang_config(args) -> SglangConfig:
     )
 
 
+def _trajectory_level_metrics(args, samples) -> dict[str, float]:
+    """Turn-level training makes every metric above turn-weighted (a 20-turn
+    trajectory counts 20x a 1-turn one). Report success per trajectory too, using
+    the one is_last_turn sample each browser episode emits."""
+    last_turns = [s for s in samples if (s.metadata or {}).get("is_last_turn")]
+    if not last_turns:
+        return {}
+    rewards = [s.get_reward_value(args) for s in last_turns if s.reward is not None]
+    rewards = [r for r in rewards if r is not None]
+    out = {
+        "num_trajectories": len(last_turns),
+        "traj_reward_mean": sum(rewards) / len(rewards) if rewards else 0.0,
+        "traj_success_rate": sum(1 for r in rewards if r == 1) / len(rewards) if rewards else 0.0,
+    }
+
+    # Wall-clock attribution written by openwebrl.generate_browser: per-turn
+    # encode / SGLang / browser seconds, and per-trajectory total on the last turn.
+    def _mean(key, pool):
+        vals = [(s.metadata or {}).get(key) for s in pool]
+        vals = [v for v in vals if isinstance(v, (int, float))]
+        return (sum(vals) / len(vals)) if vals else None
+
+    for key in (
+        "step_encode_secs",
+        "step_infer_secs",
+        "step_env_secs",
+        "step_env_a11y_secs",
+        "step_env_action_secs",
+        "step_env_screenshot_secs",
+        "step_env_tabs_secs",
+        "env_setup_secs",
+    ):
+        if (m := _mean(key, samples)) is not None:
+            out[key] = m
+    if (m := _mean("traj_wall_secs", last_turns)) is not None:
+        out["traj_wall_secs_mean"] = m
+        walls = sorted(
+            v for v in ((s.metadata or {}).get("traj_wall_secs") for s in last_turns) if isinstance(v, (int, float))
+        )
+        out["traj_wall_secs_p90"] = walls[int(0.9 * (len(walls) - 1))]
+        out["traj_wall_secs_max"] = walls[-1]
+    return out
+
+
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
@@ -1365,6 +1437,7 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            log_dict |= dict_add_prefix(_trajectory_level_metrics(args, samples), f"eval/{key}/")
             non_aborted_samples = [sample for sample in samples if sample.status != Sample.Status.ABORTED]
             non_aborted_rewards = [
                 sample.get_reward_value(args)
@@ -1423,6 +1496,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
+    log_dict |= dict_add_prefix(_trajectory_level_metrics(args, samples), "rollout/")
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)

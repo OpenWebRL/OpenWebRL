@@ -1,3 +1,4 @@
+import os
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
@@ -24,6 +25,7 @@ from slime.utils.ppo_utils import (
 )
 from slime.utils.types import RolloutBatch
 
+from . import response_logits
 from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
@@ -80,6 +82,12 @@ def get_responses(
         logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
+    # When the output layer only ran on response positions, the logits arrive compacted:
+    # sample i occupies response_length rows starting at compact_offsets[i].
+    compact_offsets = response_logits.selection_offsets()
+    if compact_offsets is not None:
+        assert cp_size == 1, "response-only logits does not support context parallelism"
+        assert logits.size(0) == sum(response_lengths), f"{logits.size(0)} vs {sum(response_lengths)}"
     end = 0
     seq_start = 0
     for i, (tokens, total_length, response_length) in enumerate(
@@ -87,7 +95,11 @@ def get_responses(
     ):
         max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
 
-        if cp_size == 1:
+        if compact_offsets is not None:
+            start = compact_offsets[i]
+            logits_chunk = logits[start : start + response_length]
+            tokens_chunk = tokens[-response_length:]
+        elif cp_size == 1:
             if qkv_format == "bshd":
                 end = max_seq_len * i + total_length
                 start = end - response_length
@@ -613,6 +625,44 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _sampler_mismatch_metrics(batch: RolloutBatch, sum_of_sample_mean: Callable) -> dict[str, torch.Tensor]:
+    """Rollout-training mismatch, in probability space, per response.
+
+    https://fengyao.notion.site/off-policy-rl : the per-token mean stays flat while a few
+    tokens per response diverge badly, so the mean alone cannot tell a healthy run from one
+    whose sampler and learner disagree. "mismatch_prob_max" is the per-response max
+    |p_learner - p_sampler| averaged over responses, and "mismatch_frac_gt_0p5" the share of
+    responses whose max passes the blog's 0.5 "high mismatch" line.
+
+    Every metric is a sum over the samples of this micro-batch; the trainer divides by the
+    sample count. The per-response max needs the whole response on one rank, so it is skipped
+    under context parallelism (the mean is not).
+    """
+    learner_log_probs = batch["log_probs"]
+    metrics = {
+        "mismatch_prob_mean": sum_of_sample_mean(
+            (torch.cat(learner_log_probs, dim=0).exp() - torch.cat(batch["rollout_log_probs"], dim=0).exp()).abs()
+        ).clone().detach()
+    }
+    if mpu.get_context_parallel_world_size() > 1:
+        return metrics
+
+    max_sum = None
+    n_high = None
+    for learner, sampler, loss_mask in zip(
+        learner_log_probs, batch["rollout_log_probs"], batch["loss_masks"], strict=False
+    ):
+        # loss_mask is 0 on the prompt/tool tokens, whose rollout log-prob is a placeholder.
+        per_response_max = ((learner.exp() - sampler.exp()).abs() * loss_mask).max()
+        max_sum = per_response_max if max_sum is None else max_sum + per_response_max
+        high = (per_response_max > 0.5).float()
+        n_high = high if n_high is None else n_high + high
+
+    metrics["mismatch_prob_max"] = max_sum.clone().detach()
+    metrics["mismatch_frac_gt_0p5"] = n_high.clone().detach()
+    return metrics
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -798,9 +848,17 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
+    sampler_mismatch = {}
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        sampler_mismatch = _sampler_mismatch_metrics(batch, sum_of_sample_mean)
+        # SLIME_LOGPROB_DEBUG=1: dump, for the first micro-batches, how the trainer's log-probs
+        # compare with the ones SGLang returned for the same sampled tokens. A large, uniform
+        # gap means a train/inference modeling or convention mismatch; a gap concentrated on
+        # a few samples or positions means misaligned tokens.
+        if os.environ.get("SLIME_LOGPROB_DEBUG") == "1" and torch.distributed.get_rank() == 0:
+            _logprob_debug(batch, log_probs, rollout_log_probs, logits)
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -813,6 +871,8 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
+
+    reported_loss.update(sampler_mismatch)
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
@@ -1067,3 +1127,77 @@ def loss_function(
             ),
         },
     )
+
+
+_LOGPROB_DEBUG_CALLS = 0
+
+
+def _logprob_debug(batch, log_probs, rollout_log_probs, logits):
+    global _LOGPROB_DEBUG_CALLS
+    _LOGPROB_DEBUG_CALLS += 1
+    if _LOGPROB_DEBUG_CALLS > 3:
+        return
+    try:
+        from slime.utils.processing_utils import load_tokenizer
+        from megatron.training.global_vars import get_args
+
+        tok = load_tokenizer(get_args().hf_checkpoint, trust_remote_code=True)
+    except Exception:
+        tok = None
+    d = (log_probs.detach().float() - rollout_log_probs.detach().float())
+    dump_dir = os.environ.get("SLIME_LOGPROB_DUMP", "")
+    if dump_dir:
+        # per-token trainer vs rollout log-probs for every sample of this micro-batch, so an
+        # offline HF reference can be run on exactly these samples (matched by token ids)
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            recs, off = [], 0
+            for tokens, rl in zip(batch["unconcat_tokens"], batch["response_lengths"]):
+                recs.append({"tokens": tokens.detach().cpu().tolist(), "rl": int(rl),
+                             "trainer_lp": log_probs[off:off + rl].detach().float().cpu().tolist(),
+                             "rollout_lp": rollout_log_probs[off:off + rl].detach().float().cpu().tolist()})
+                off += int(rl)
+            torch.save(recs, os.path.join(dump_dir, f"mb{_LOGPROB_DEBUG_CALLS}_rank{rank}.pt"))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LOGPROB_DEBUG dump failed: %r", e)
+    logger.warning(
+        "LOGPROB_DEBUG micro-batch %d: %d response tokens | trainer-rollout logprob: mean %.3f  median %.3f  "
+        "p10 %.3f  p90 %.3f | trainer mean %.3f rollout mean %.3f | frac |diff|>1: %.3f",
+        _LOGPROB_DEBUG_CALLS, d.numel(), d.mean(), d.median(), d.quantile(0.1), d.quantile(0.9),
+        log_probs.float().mean(), rollout_log_probs.float().mean(), (d.abs() > 1).float().mean(),
+    )
+    # per-sample view and token alignment for the first few samples
+    offset = 0
+    for i, (tokens, rl) in enumerate(zip(batch["unconcat_tokens"], batch["response_lengths"])):
+        if i >= 4:
+            break
+        seg = d[offset : offset + rl]
+        resp = tokens[-rl:]
+        # argmax of the trainer distribution at each response position vs the sampled token
+        lp_seg = None
+        try:
+            chunk = list(get_responses(logits, args=get_args(), unconcat_tokens=batch["unconcat_tokens"],
+                                       total_lengths=batch["total_lengths"], response_lengths=batch["response_lengths"],
+                                       max_seq_lens=batch.get("max_seq_lens")))[i][0]
+            agree = (chunk.argmax(-1) == resp).float().mean().item()
+        except Exception as e:  # noqa: BLE001
+            agree = float("nan")
+        text = tok.decode(resp[:40]) if tok is not None else str(resp[:20].tolist())
+        logger.warning(
+            "LOGPROB_DEBUG sample %d: resp_len %d | diff mean %.3f | first-token diff %.3f last-token diff %.3f | "
+            "trainer-argmax==sampled %.2f | resp head: %r",
+            i, rl, seg.mean(), seg[0], seg[-1], agree, text[:160],
+        )
+        # the worst tokens: position, token text, rollout lp, trainer lp
+        worst = torch.argsort(seg)[:6].tolist()
+        rows = []
+        for j in worst:
+            tid = int(resp[j])
+            ts = tok.decode([tid]) if tok is not None else str(tid)
+            rows.append(f"pos {j}/{rl} tok {tid} {ts!r} rollout {float(rollout_log_probs[offset + j]):.2f} trainer {float(log_probs[offset + j]):.2f}")
+        logger.warning("LOGPROB_DEBUG sample %d worst tokens: %s", i, " || ".join(rows))
+        # and the last 3 tokens explicitly (stop-token handling)
+        tail = [f"{tok.decode([int(t)])!r}:{float(rollout_log_probs[offset+k]):.2f}/{float(log_probs[offset+k]):.2f}" for k, t in zip(range(rl-3, rl), resp[-3:])] if tok is not None else []
+        logger.warning("LOGPROB_DEBUG sample %d tail tokens (rollout/trainer): %s", i, "  ".join(tail))
+        offset += rl

@@ -36,12 +36,19 @@ class AsyncLoopThread:
 
 # Create one global instance
 async_loop = None
+_async_loop_lock = threading.Lock()
 
 
 def get_async_loop():
+    # Ray actors with max_concurrency > 1 call run() from several threads at once
+    # (StreamingShardActor.run_group); without the lock two threads each built a loop and
+    # every asyncio primitive created on one of them then raised "bound to a different
+    # event loop" for callers on the other.
     global async_loop
     if async_loop is None:
-        async_loop = AsyncLoopThread()
+        with _async_loop_lock:
+            if async_loop is None:
+                async_loop = AsyncLoopThread()
     return async_loop
 
 

@@ -1,10 +1,15 @@
 """Browserbase remote browser environment.
 
 Same shape as ``browser_use_env.py``: a ``WebEnv`` attached to a remote Chromium
-over CDP. Sessions run with advanced stealth and residential proxies, so pages
+over CDP. Sessions run with advanced stealth (proxies off by default), so pages
 rarely serve a 403/CAPTCHA interstitial; when one is served Browserbase solves
 it in-band and announces it over the console, and we must sit still until it
 settles (``_wait_for_captcha_if_needed``).
+
+Session creation goes through a process-wide throttle (``_SpawnThrottle``): at
+most ``max_sessions`` live at once and at most ``spawn_per_minute`` created per
+sliding minute, with retries on 429/5xx. Defaults sit under the account's
+250-concurrent / 100-per-minute limits.
 
 Advanced stealth pins the viewport to 1280x720 and ignores both
 ``browser_settings.viewport`` and ``fingerprint.screen``; a CDP
@@ -31,7 +36,7 @@ if _REPO_ROOT not in sys.path:
 
 from playwright.async_api import async_playwright
 
-from openwebrl.env.web_env import WebEnv
+from openwebrl.env.web_env import WebEnv, _FAST_STEP
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +50,39 @@ _CAPTCHA_TIMEOUT_SECS = 30.0
 _CAPTCHA_GRACE_POLLS = 3
 _CAPTCHA_POLL_SECS = 0.5
 
-_MANIFEST_DIR = os.path.join(
+# Live-session markers. Every job runs `--cleanup` at start, which releases EVERY
+# session listed here -- so two jobs sharing this dir kill each other's browsers.
+# Set BROWSERBASE_MANIFEST_DIR per run when jobs may overlap.
+_MANIFEST_DIR = os.environ.get("BROWSERBASE_MANIFEST_DIR") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".browserbase_sessions"
 )
+
+
+def _same_site(current: str, target: str) -> bool:
+    """True when the page already sits on the target's host (sites redirect the
+    bare start URL to a canonical path, so an exact match would never hit)."""
+    from urllib.parse import urlparse
+    try:
+        a, b = urlparse(current), urlparse(target)
+    except Exception:
+        return False
+    return bool(a.netloc) and a.netloc.lower().removeprefix("www.") == b.netloc.lower().removeprefix("www.")
+
+
+def _ensure_asyncio_subprocess_support() -> None:
+    """Playwright's driver is a child process. Inside slime's RolloutManager the
+    running loop is a stock asyncio loop, but sglang imports install uvloop's
+    event-loop policy, whose get_child_watcher() raises a bare NotImplementedError
+    -- so every setup() died before the first step (eval 0 aborted_ratio 1.0).
+    Restore the default policy when that combination is detected; a uvloop loop
+    itself spawns subprocesses natively and is left alone."""
+    if not isinstance(asyncio.get_running_loop(), asyncio.SelectorEventLoop):
+        return
+    try:
+        asyncio.get_event_loop_policy().get_child_watcher()
+    except NotImplementedError:
+        logger.warning("Event-loop policy has no child watcher; switching to asyncio.DefaultEventLoopPolicy")
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
 
 def _save_session_id(session_id: Any) -> None:
@@ -129,12 +164,15 @@ class BrowserbaseWebEnv(WebEnv):
         # WebEnv.reset() re-enters _initialize_context; without this the console
         # handlers stack up and every CAPTCHA event gets counted N times.
         self._listeners_attached = False
+        # Set by create_browserbase_env once setup succeeds; exit() gives the slot back.
+        self._throttle: Optional["_SpawnThrottle"] = None
 
     # ------------------------------------------------------------------
     # Setup
     # ------------------------------------------------------------------
 
     async def setup(self) -> None:
+        _ensure_asyncio_subprocess_support()
         self.playwright = await async_playwright().start()
         self.browser_type = self.playwright.chromium
         self.browser = await self.browser_type.connect_over_cdp(self.cdp_url)
@@ -231,6 +269,10 @@ class BrowserbaseWebEnv(WebEnv):
 
         for i, url in enumerate(start_urls):
             page = existing_pages[i] if i < len(existing_pages) else await self.context.new_page()
+            # reset() re-enters here right after setup() already navigated to the
+            # same URL; the fast path skips the second navigation (6-8 s).
+            if _FAST_STEP and _same_site(page.url, url):
+                continue
             for attempt in range(self.max_retries):
                 try:
                     await page.goto(url, timeout=self.init_navigation_timeout, wait_until="domcontentloaded")
@@ -255,7 +297,10 @@ class BrowserbaseWebEnv(WebEnv):
         # The landing page itself can be gated; let any interstitial resolve
         # before the first screenshot is taken.
         await self._wait_for_captcha_if_needed()
-        await asyncio.sleep(2)
+        if _FAST_STEP:
+            await self._settle_until_ready()
+        else:
+            await asyncio.sleep(2)
 
     # ------------------------------------------------------------------
     # CAPTCHA handling
@@ -296,6 +341,11 @@ class BrowserbaseWebEnv(WebEnv):
         must issue nothing but the cookie pump that drains the event queue.
         """
         await self._pump()
+
+        # Fast path: one pump drains queued console events; no blind 1.5 s grace
+        # polling after every action. The listener still catches a real challenge.
+        if not self._captcha_events and _FAST_STEP:
+            return
 
         if not self._captcha_events:
             for _ in range(_CAPTCHA_GRACE_POLLS):
@@ -383,6 +433,11 @@ class BrowserbaseWebEnv(WebEnv):
 
         _remove_session_id(self.session_id)
 
+        # Release exactly once even if exit() is called twice.
+        if self._throttle is not None:
+            self._throttle.release_slot()
+            self._throttle = None
+
         if self.playwright:
             try:
                 await self.playwright.stop()
@@ -400,6 +455,104 @@ def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _as_int(value: Any, default: int) -> int:
+    if value in (None, ""):
+        return default
+    return int(value)
+
+
+# Account limits: 250 concurrent sessions and 100 session creates per minute.
+# Both are enforced server-side with 429s, and a 429 mid-rollout costs the whole
+# episode, so we stay under them client-side. One slot pool + one spawn window
+# per process (per event loop); slime runs all rollouts of a step in one process.
+_DEFAULT_MAX_SESSIONS = 240
+_DEFAULT_SPAWN_PER_MINUTE = 90
+_SPAWN_WINDOW_SECS = 60.0
+_CREATE_MAX_ATTEMPTS = 8
+_CREATE_BACKOFF_SECS = 5.0
+
+
+class _SpawnThrottle:
+    """Slot pool (concurrent sessions) + sliding-window rate limit (creates/min)."""
+
+    def __init__(self, max_sessions: int, spawn_per_minute: int) -> None:
+        self.max_sessions = max_sessions
+        self.spawn_per_minute = spawn_per_minute
+        self._slots = asyncio.Semaphore(max_sessions)
+        self._spawn_times: List[float] = []
+        self._spawn_lock = asyncio.Lock()
+
+    async def acquire_slot(self) -> None:
+        await self._slots.acquire()
+
+    def release_slot(self) -> None:
+        self._slots.release()
+
+    async def wait_for_spawn(self) -> None:
+        # Serialised so N waiters do not all wake on the same expiry and burst.
+        async with self._spawn_lock:
+            while True:
+                now = time.monotonic()
+                self._spawn_times = [t for t in self._spawn_times if now - t < _SPAWN_WINDOW_SECS]
+                if len(self._spawn_times) < self.spawn_per_minute:
+                    self._spawn_times.append(now)
+                    return
+                await asyncio.sleep(self._spawn_times[0] + _SPAWN_WINDOW_SECS - now + 0.05)
+
+
+_THROTTLES: Dict[int, _SpawnThrottle] = {}
+
+
+def _get_throttle(browserbase_cfg: Dict[str, Any]) -> _SpawnThrottle:
+    # asyncio primitives bind to the loop they are first used on; key by loop so a
+    # fresh asyncio.run() (eval scripts) gets a fresh throttle.
+    loop_id = id(asyncio.get_running_loop())
+    throttle = _THROTTLES.get(loop_id)
+    if throttle is None:
+        throttle = _SpawnThrottle(
+            max_sessions=_as_int(
+                os.environ.get("BROWSERBASE_MAX_SESSIONS", browserbase_cfg.get("max_sessions")),
+                _DEFAULT_MAX_SESSIONS,
+            ),
+            spawn_per_minute=_as_int(
+                os.environ.get("BROWSERBASE_SPAWN_PER_MINUTE", browserbase_cfg.get("spawn_per_minute")),
+                _DEFAULT_SPAWN_PER_MINUTE,
+            ),
+        )
+        _THROTTLES.clear()
+        _THROTTLES[loop_id] = throttle
+        logger.info(
+            "Browserbase throttle: max %d concurrent sessions, %d spawns/min",
+            throttle.max_sessions, throttle.spawn_per_minute,
+        )
+    return throttle
+
+
+def _is_retryable_create_error(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status is not None:
+        return status == 429 or status >= 500
+    # Stainless SDK: APIConnectionError / APITimeoutError carry no status_code.
+    return "Connection" in type(exc).__name__ or "Timeout" in type(exc).__name__
+
+
+async def _create_session_with_retry(client: Any, throttle: _SpawnThrottle, create_kwargs: Dict[str, Any]) -> Any:
+    for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
+        await throttle.wait_for_spawn()
+        try:
+            return await client.sessions.create(**create_kwargs)
+        except Exception as exc:
+            if attempt == _CREATE_MAX_ATTEMPTS or not _is_retryable_create_error(exc):
+                raise
+            delay = min(_CREATE_BACKOFF_SECS * 2 ** (attempt - 1), 120.0)
+            logger.warning(
+                "Browserbase session create failed (attempt %d/%d, %s: %s); retrying in %.0fs",
+                attempt, _CREATE_MAX_ATTEMPTS, type(exc).__name__, exc, delay,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 async def create_browserbase_env(
@@ -432,8 +585,8 @@ async def create_browserbase_env(
     }
 
     # Proxies are what change the egress IP; advanced stealth alone does not.
-    # They bill per GB, hence the explicit switch.
-    proxies = _as_bool(os.environ.get("BROWSERBASE_PROXIES", browserbase_cfg.get("proxies")), True)
+    # They bill per GB and are off by default -- opt in explicitly.
+    proxies = _as_bool(os.environ.get("BROWSERBASE_PROXIES", browserbase_cfg.get("proxies")), False)
 
     create_kwargs: Dict[str, Any] = {
         "project_id": project_id,
@@ -449,6 +602,10 @@ async def create_browserbase_env(
     if region:
         create_kwargs["region"] = region
 
+    throttle = _get_throttle(browserbase_cfg)
+    # Held from here until BrowserbaseWebEnv.exit() (or the failure path below).
+    await throttle.acquire_slot()
+    slot_owned_by_env = False
     session = None
     try:
         print(
@@ -457,7 +614,7 @@ async def create_browserbase_env(
             f"solve_captchas={browser_settings['solve_captchas']}, "
             f"proxies={proxies}, timeout_s={create_kwargs.get('api_timeout')})..."
         )
-        session = await client.sessions.create(**create_kwargs)
+        session = await _create_session_with_retry(client, throttle, create_kwargs)
         # Marker BEFORE anything that can fail, so a Ctrl+C still leaves a trace.
         _save_session_id(session.id)
         print(f"✅ [Created Browserbase session {session.id}]")
@@ -490,6 +647,8 @@ async def create_browserbase_env(
             policy=policy,
         )
         await env.setup()
+        env._throttle = throttle
+        slot_owned_by_env = True
         return env
 
     except BaseException:
@@ -503,6 +662,9 @@ async def create_browserbase_env(
                 logger.warning("Release-on-failure failed: %s", exc)
             _remove_session_id(session.id)
         raise
+    finally:
+        if not slot_owned_by_env:
+            throttle.release_slot()
 
 
 # ---------------------------------------------------------------------------

@@ -40,7 +40,7 @@ while read -r id label; do
   # Fatal signatures only. A bare "Traceback" is not one: generate_turn_sample logs
   # a per-task traceback at WARNING level for every retried browser task, so
   # matching it alerted on a perfectly healthy rollout.
-  crash=$(printf '%s' "$LG" | grep -aoE "no kernel image|Mismatched number of arguments|PTXAS error|Capture cuda graph failed|OutOfMemoryError|torch.OutOfMemoryError|NCCL.*(error|timeout)|ActorDiedError|RayTaskError|ray.exceptions|The actor died|ImportError: cannot import|Killed" | sort -u | tr '\n' ' ')
+  crash=$(printf '%s' "$LG" | grep -aoE "no kernel image|Mismatched number of arguments|PTXAS error|Capture cuda graph failed|OutOfMemoryError|torch.OutOfMemoryError|NCCL.*(error|timeout)|ActorDiedError|RayTaskError|ray.exceptions|The actor died|ImportError: cannot import" | sort -u | tr '\n' ' ')
   prog=$(printf '%s' "$LG" | grep -aoE "rollout_id=[0-9]+" | tail -1)
   rew=$(printf '%s' "$LG" | grep -aoE "rollout/raw_reward_mean': ?[0-9.]+" | tail -1)
   ck=$(printf '%s' "$LG" | grep -aoE "iter_0*[1-9][0-9]*" | tail -1)

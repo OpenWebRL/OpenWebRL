@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 import ray
@@ -93,6 +94,9 @@ def train(args):
     # always update weight first so that sglang has the loaded weights from training.
     if not args.critic_train_only:
         actor_model.update_weights()
+        _ray_get_with_actor_retry(
+            rollout_manager.set_weight_version.remote(args.start_rollout_id), label="rollout_manager.set_weight_version"
+        )
 
         if args.check_weight_update_equal:
             _ray_get_with_actor_retry(
@@ -135,6 +139,11 @@ def train(args):
         if args.rollout_global_dataset:
             _ray_get_with_actor_retry(rollout_manager.save.remote(rollout_id), label=f"rollout_manager.save({rollout_id})")
 
+    # SLIME_STREAM_PREFETCH=1 (streaming rollout only): issue generate(rollout_id + 1) before
+    # training step rollout_id so the next drain + sample conversion overlaps training.
+    prefetch_generate = os.environ.get("SLIME_STREAM_PREFETCH", "0") == "1" and not args.use_critic
+    pending_generate = None
+
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
     try:
@@ -161,10 +170,15 @@ def train(args):
                 num_rollout_per_epoch=num_rollout_per_epoch,
             )
             _log_train_progress(rollout_id, args.num_rollout, "generate")
+            if pending_generate is None:
+                pending_generate = rollout_manager.generate.remote(rollout_id)
             rollout_data_ref = _ray_get_with_actor_retry(
-                rollout_manager.generate.remote(rollout_id),
+                pending_generate,
                 label=f"rollout_manager.generate({rollout_id})",
             )
+            pending_generate = None
+            if prefetch_generate and rollout_id + 1 < args.num_rollout:
+                pending_generate = rollout_manager.generate.remote(rollout_id + 1)
 
             if args.offload_rollout:
                 _ray_get_with_actor_retry(rollout_manager.offload.remote(), label="rollout_manager.offload")
@@ -229,8 +243,14 @@ def train(args):
                     rollout_manager.onload_weights.remote(),
                     label="rollout_manager.onload_weights",
                 )
-            if not args.critic_train_only:
+            # SLIME_STREAM_UPDATE_EVERY=k pushes weights to the rollout engines only every k
+            # steps (streaming rollout sweep knob); the version counter tracks pushes, not steps.
+            update_every = int(os.environ.get("SLIME_STREAM_UPDATE_EVERY", "1") or 1)
+            if not args.critic_train_only and (rollout_id + 1) % update_every == 0:
                 actor_model.update_weights()
+                _ray_get_with_actor_retry(
+                    rollout_manager.set_weight_version.remote(rollout_id + 1), label="rollout_manager.set_weight_version"
+                )
             if args.offload_rollout:
                 _ray_get_with_actor_retry(rollout_manager.onload_kv.remote(), label="rollout_manager.onload_kv")
 

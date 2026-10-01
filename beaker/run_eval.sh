@@ -40,19 +40,20 @@ fi
 # ---- Benchmark selection. Paper Table 8 sets 3 judge screenshots; run_eval.py's
 # per-protocol default would be 30 for webvoyager/deepshop. Measured: no
 # difference on WebVoyager (11 tasks up, 11 down) or om2w (+1.0, inside noise). ----
+# TASK_FILE may be preset (e.g. a pilot subset) and then only the protocol comes from BENCH.
 case "${BENCH}" in
   om2w)
-    export TASK_FILE="openwebrl/data/eval/online-mind2web.jsonl"
+    export TASK_FILE="${TASK_FILE:-openwebrl/data/eval/online-mind2web.jsonl}"
     export EVAL_PROTOCOL="online_mind2web"
     export JUDGE_MAX_ATTACHED_IMGS=3
     ;;
   webvoyager)
-    export TASK_FILE="openwebrl/data/eval/webvoyager_fara.jsonl"
+    export TASK_FILE="${TASK_FILE:-openwebrl/data/eval/webvoyager_fara.jsonl}"
     export EVAL_PROTOCOL="webvoyager"
     export JUDGE_MAX_ATTACHED_IMGS=3
     ;;
   deepshop)
-    export TASK_FILE="openwebrl/data/eval/deepshop.jsonl"
+    export TASK_FILE="${TASK_FILE:-openwebrl/data/eval/deepshop.jsonl}"
     export EVAL_PROTOCOL="deepshop"
     export JUDGE_MAX_ATTACHED_IMGS=3
     ;;
@@ -65,13 +66,28 @@ RUN_TAG="${RUN_TAG:-${BENCH}}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${OPENWEBRL_ROOT}/outputs/eval/${CKPT_SLUG}/${RUN_TAG}}"
 mkdir -p "${OUTPUT_ROOT}"
 
-# ---- Judge over the public OpenAI API. JUDGE_MODEL stays empty so
-# run_evaluate.py applies the protocol default; `served` is the only mode that
-# talks to non-Azure OpenAI. ----
+# ---- Judge. Default: public OpenAI API with JUDGE_MODEL empty so run_evaluate.py
+# applies the protocol default; `served` is the only mode that talks to non-Azure
+# OpenAI. Alternative: a self-hosted judge (beaker/run_judge_server.sh) that
+# publishes its URL to JUDGE_ENDPOINT_FILE; then JUDGE_MODEL must be set. ----
 export JUDGE_API_MODE="served"
+if [ -n "${JUDGE_ENDPOINT_FILE:-}" ]; then
+  for _i in $(seq 1 120); do   # the judge job may still be loading weights
+    [ -s "${JUDGE_ENDPOINT_FILE}" ] && break
+    echo "waiting for judge endpoint file ${JUDGE_ENDPOINT_FILE} (${_i}/120)"; sleep 30
+  done
+  JUDGE_API_BASE="$(cat "${JUDGE_ENDPOINT_FILE}")"
+  [ -n "${JUDGE_API_BASE}" ] || { echo "ERROR: empty judge endpoint file"; exit 4; }
+fi
 export JUDGE_API_BASE="${JUDGE_API_BASE:-https://api.openai.com}"
 export JUDGE_MODEL="${JUDGE_MODEL:-}"   # empty => protocol default (o4-mini om2w / gpt-4o wv)
-: "${OPENAI_API_KEY:?OPENAI_API_KEY must be injected as a gantry secret-env}"
+if [ "${JUDGE_API_BASE}" = "https://api.openai.com" ]; then
+  : "${OPENAI_API_KEY:?OPENAI_API_KEY must be injected as a gantry secret-env}"
+else
+  : "${JUDGE_MODEL:?a non-OpenAI JUDGE_API_BASE needs an explicit JUDGE_MODEL}"
+  export JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
+  export JUDGE_MAX_TOKENS="${JUDGE_MAX_TOKENS:-2048}"   # sglang's default 128 truncates the verdict
+fi
 
 # ---- Browser env mode. local_process blocks on ~16% of tasks; browser-use is
 # the paper's backend and is worth +20 points on om2w. ----
@@ -97,20 +113,22 @@ if [ "${SLIME_BROWSER_ENV_MODE}" = "browser-use" ]; then
   python -m openwebrl.env.browser_use_env --cleanup || true
 fi
 if [ "${SLIME_BROWSER_ENV_MODE}" = "browserbase" ]; then
-  # Bills per browser-minute AND per GB of proxy egress, so keep n_parallel and
-  # the task set deliberate.
+  # Bills per browser-minute, so keep n_parallel and the task set deliberate.
+  # Standing rules: proxies OFF, advanced stealth ON, viewport 1280x720 (what
+  # stealth renders anyway; asking for anything else mis-scales clicks).
   : "${BROWSERBASE_API_KEY:?browserbase mode requires BROWSERBASE_API_KEY}"
   : "${BROWSERBASE_PROJECT_ID:?browserbase mode requires BROWSERBASE_PROJECT_ID}"
   export BROWSERBASE_API_KEY BROWSERBASE_PROJECT_ID
-  export BROWSERBASE_PROXIES="${BROWSERBASE_PROXIES:-true}"
+  export BROWSERBASE_PROXIES="${BROWSERBASE_PROXIES:-false}"
   export BROWSERBASE_ADVANCED_STEALTH="${BROWSERBASE_ADVANCED_STEALTH:-true}"
   export BROWSERBASE_SOLVE_CAPTCHAS="${BROWSERBASE_SOLVE_CAPTCHAS:-true}"
+  export SLIME_BROWSER_VIEWPORT="${SLIME_BROWSER_VIEWPORT:-1280x720}"
   # Let the step budget end the episode, not the project's default session cap.
   export BROWSERBASE_SESSION_TIMEOUT_S="${BROWSERBASE_SESSION_TIMEOUT_S:-1800}"
   python -c "import browserbase" 2>/dev/null \
     || pip install --no-cache-dir "browserbase==1.4.0" \
     || { echo "ERROR: could not install the browserbase SDK"; exit 6; }
-  echo "browserbase mode: proxies=${BROWSERBASE_PROXIES} stealth=${BROWSERBASE_ADVANCED_STEALTH} viewport=${SLIME_BROWSER_VIEWPORT:-1280x1000 (config default)}"
+  echo "browserbase mode: proxies=${BROWSERBASE_PROXIES} stealth=${BROWSERBASE_ADVANCED_STEALTH} viewport=${SLIME_BROWSER_VIEWPORT}"
   # Release anything a previous aborted run left live before opening new sessions.
   python -m openwebrl.env.browserbase_env --cleanup || true
 fi
@@ -145,9 +163,9 @@ export FLASHINFER_DISABLE_VERSION_CHECK=1
 echo "Probing outbound web access..."
 curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "example.com -> %{http_code}\n" https://example.com \
   || { echo "ERROR: no outbound web access; local_process rollouts cannot browse. Aborting."; exit 3; }
-curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "openai -> %{http_code}\n" \
-  -H "Authorization: Bearer ${OPENAI_API_KEY}" https://api.openai.com/v1/models \
-  || { echo "ERROR: judge endpoint unreachable. Aborting."; exit 4; }
+curl -sS --connect-timeout 10 --max-time 20 -o /dev/null -w "judge -> %{http_code}\n" \
+  -H "Authorization: Bearer ${OPENAI_API_KEY:-${JUDGE_API_KEY:-EMPTY}}" "${JUDGE_API_BASE%/}/v1/models" \
+  || { echo "ERROR: judge endpoint ${JUDGE_API_BASE} unreachable. Aborting."; exit 4; }
 
 # ---- Chromium for Playwright (python package is in the image's requirements) ----
 python -m playwright install chromium || playwright install chromium

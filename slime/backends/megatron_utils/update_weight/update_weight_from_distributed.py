@@ -14,6 +14,7 @@ from tqdm import tqdm
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
+from .hf_weight_iterator_base import HfWeightIteratorBase
 from .common import all_gather_param, named_params_and_buffers
 
 
@@ -41,6 +42,19 @@ class UpdateWeightFromDistributed:
         self.quantization_config = quantization_config
         self.weight_version = 0
         self._model_update_groups = None
+        self.weights_getter = weights_getter
+        # The per-parameter converters in megatron_to_hf/ are text-only. A model the
+        # bridge builds (any VL model: vision tower plus fused linear-attention and MLP
+        # projections) has Megatron names with no one-to-one HF counterpart, so in bridge
+        # mode the conversion has to go through megatron-bridge, exactly as the colocated
+        # path already does.
+        self._hf_weight_iterator = (
+            HfWeightIteratorBase.create(
+                args=args, model=model, model_name=model_name, quantization_config=quantization_config
+            )
+            if getattr(args, "megatron_to_hf_mode", "raw") == "bridge"
+            else None
+        )
 
     def connect_rollout_engines(
         self,
@@ -103,6 +117,14 @@ class UpdateWeightFromDistributed:
         # non expert params
         pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
 
+        if self._hf_weight_iterator is not None:
+            self._update_weights_via_bridge(pbar)
+            dist.barrier(group=get_gloo_group())
+            if dist.get_rank() == 0:
+                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            dist.barrier(group=get_gloo_group())
+            return
+
         for name, param in named_params_and_buffers(self.args, self.model):
             if ".experts." in name:
                 continue
@@ -138,6 +160,20 @@ class UpdateWeightFromDistributed:
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _update_weights_via_bridge(self, pbar: tqdm | None) -> None:
+        """Convert the whole model with megatron-bridge, then broadcast chunk by chunk.
+
+        ``get_hf_weight_chunks`` gathers across tensor/pipeline parallel internally, so
+        every rank has to call it; only the PP source rank owns the NCCL group to the
+        rollout engines and does the broadcast.
+        """
+        megatron_local_weights = self.weights_getter()
+        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+            hf_named_tensors = list(hf_named_tensors)
+            if self._is_pp_src_rank:
+                self._update_bucket_weights_from_distributed(hf_named_tensors, pbar=pbar)
+            del hf_named_tensors
 
     def _update_weight_from_distributed(
         self,

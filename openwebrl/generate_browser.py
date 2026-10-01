@@ -20,8 +20,9 @@ import re
 import time
 from datetime import datetime
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 import asyncio
 import torch
 
@@ -44,6 +45,7 @@ from openwebrl.base.adapter import BaseGymEnvAdapter
 from openwebrl.base.registry import DEFAULT_REGISTRY as ENV_REGISTRY
 from openwebrl.base.utils import ToolParser
 from openwebrl.adapters.browser_adapter import BrowserEnvConfig, BrowserAdapter
+from openwebrl.adapters.molmoweb_adapter import IMAGE_PLACEHOLDER, MolmowebAdapter
 from openwebrl.response_format import (
     ensure_prompt_ends_with_visible_thinking_tag,
     get_browser_response_format_mode,
@@ -54,6 +56,7 @@ from slime.utils.types import Sample
 from slime.utils.http_utils import post
 from slime.utils.processing_utils import build_processor_kwargs
 from slime.rollout.sglang_rollout import GenerateState
+from slime.rollout.streaming_rollout import current_weight_version
 
 # Resolve the openwebrl/ directory once at import time.
 _BROWSER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +70,14 @@ _BROWSER_ROLLOUT_GATE_LOCK = asyncio.Lock()
 _BROWSER_ROLLOUT_GATE_WAITING = 0
 _BROWSER_ROLLOUT_GATE_ACTIVE = 0
 _BROWSER_HOST_BLACKLIST_PATH = os.path.join(_BROWSER_DIR, "data", "webgym_filtered_popular_blacklist_hosts.txt")
+_INFERENCE_ABORT_RETRIES = int(os.environ.get("SLIME_INFERENCE_ABORT_RETRIES", "3"))
+# dtype for pixel_values shipped to the trainer. Megatron's patch embed casts to the
+# weight dtype (bf16) anyway, so bf16 here is lossless and halves the ~22 MB/image
+# that goes through the Ray object store. Set to "fp32" to restore the old behaviour.
+_MM_PIXEL_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[
+    os.environ.get("SLIME_MM_PIXEL_DTYPE", "bf16").lower()
+]
+_INFERENCE_ABORT_RETRY_SLEEP_SECS = float(os.environ.get("SLIME_INFERENCE_ABORT_RETRY_SLEEP_SECS", "2"))
 _TASK_JSONL_CACHE: dict[str, dict[str, Any]] = {}
 _TASK_JSONL_INDEX_CACHE: dict[str, list[dict[str, Any]]] = {}
 
@@ -315,6 +326,39 @@ async def _browser_rollout_submission_slot(args: Any, task_id: str):
 
 _ACTION_BLOCK_RE = re.compile(r"<action>.*?</action>", re.DOTALL)
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+
+
+def _get_max_past_steps(args: Any) -> int:
+    """Completed steps kept in the prompt (0 = unbounded, the default).
+
+    molmoweb checkpoints were built with a 10-step window, so a longer history at
+    rollout time prompts them off the distribution they were trained on.
+    """
+    raw = _get_env_override("SLIME_BROWSER_MAX_PAST_STEPS")
+    if raw is None:
+        raw = getattr(args, "browser_max_past_steps", None)
+    try:
+        return max(0, int(raw)) if raw not in (None, "") else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _apply_history_window(mm_messages: list[dict[str, Any]], max_past_steps: int) -> list[dict[str, Any]]:
+    """Keep the system turn, the first user/assistant pair (the task) and the last
+    `max_past_steps` completed steps plus the current user turn.
+
+    Mirrors `_build_request()` in molmoweb's agent/fara15_vllm.py, which applies the
+    step window before the screenshot budget so the kept images come from the same
+    turns a training row would have carried.
+    """
+    if max_past_steps <= 0:
+        return mm_messages
+    system = mm_messages[:1] if mm_messages and mm_messages[0].get("role") == "system" else []
+    history = mm_messages[len(system):]
+    keep_from = max(0, (len(history) + 1) - 2 * (max_past_steps + 1))
+    if keep_from <= 0:
+        return mm_messages
+    return system + history[0:2] + history[keep_from:]
 
 
 def _get_browser_response_mode(args: Any):
@@ -1019,9 +1063,16 @@ async def _initialize_resources(args: Any, task_id: str, task_metadata: dict[str
     env_config = _apply_sandbox_env_overrides(env_config)
     env_config = _apply_local_process_env_overrides(env_config)
 
+    # The molmoweb response format needs its own prompt/parse/action mapping.
+    response_mode_name = getattr(args, "browser_response_format_mode", "slime")
+    adapter_class = (
+        MolmowebAdapter
+        if get_browser_response_format_mode(response_mode_name).name == "molmoweb"
+        else BrowserAdapter
+    )
     ENV_REGISTRY.register(
         name=env_name,
-        adapter_class=BrowserAdapter,
+        adapter_class=adapter_class,
         config_class=BrowserEnvConfig,
         default_config=env_config,
     )
@@ -1061,18 +1112,30 @@ async def _run_inference_step(
     if image_data:
         payload["image_data"] = image_data
 
-    try:
-        if timeout_secs is not None and timeout_secs > 0:
-            output = await asyncio.wait_for(post(url, payload), timeout=timeout_secs)
-        else:
-            output = await post(url, payload)
-    except asyncio.TimeoutError as exc:
-        raise TimeoutError(
-            f"SGLang /generate timed out after {timeout_secs}s for request to {url}"
-        ) from exc
+    # A weight sync (pause_generation) aborts every in-flight request with finish_reason
+    # "abort" and no tokens; retry a few times within the same time budget instead of
+    # ending the trajectory. Only matters for non-colocated (streaming) rollouts.
+    deadline = time.monotonic() + timeout_secs if timeout_secs is not None and timeout_secs > 0 else None
+    for attempt in range(_INFERENCE_ABORT_RETRIES + 1):
+        try:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                output = await asyncio.wait_for(post(url, payload), timeout=remaining)
+            else:
+                output = await post(url, payload)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"SGLang /generate timed out after {timeout_secs}s for request to {url}"
+            ) from exc
+        meta = output.get("meta_info", {})
+        if meta.get("finish_reason", {}).get("type") == "abort" and attempt < _INFERENCE_ABORT_RETRIES:
+            logger.info("inference step aborted by the engine (weight sync?); retry %d/%d", attempt + 1, _INFERENCE_ABORT_RETRIES)
+            await asyncio.sleep(_INFERENCE_ABORT_RETRY_SLEEP_SECS)
+            continue
+        break
     response_text = output["text"]
-
-    meta = output.get("meta_info", {})
     if "output_token_logprobs" in meta:
         new_tokens = [item[1] for item in meta["output_token_logprobs"]]
         new_log_probs = [item[0] for item in meta["output_token_logprobs"]]
@@ -1089,10 +1152,26 @@ async def _run_inference_step(
     return response_text, new_tokens, new_log_probs, finish_type
 
 
+_IM_END_ID = 151645  # Qwen2/3 default; _set_im_end_id() replaces it from the served tokenizer
+_NEWLINE_ID = 198
+
+
+def _set_im_end_id(tokenizer) -> None:
+    """Qwen3.5 moved <|im_end|> to 248046; 151645 there is an ordinary Thai token."""
+    global _IM_END_ID, _NEWLINE_ID
+    try:
+        _IM_END_ID = int(tokenizer.convert_tokens_to_ids("<|im_end|>"))
+        nl = tokenizer.encode("\n", add_special_tokens=False)
+        if len(nl) == 1:
+            _NEWLINE_ID = int(nl[0])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _ensure_im_end_w_new_line(response_text: str, new_tokens: list[int], new_logprobs: list[float]) -> str:
     """
     Ensure the response text and tokens end with "<|im_end|>\n".
-    Ensure the new tokens end with [151645, 198]
+    Ensure the new tokens end with [<|im_end|>, \n] (ids from the served tokenizer)
     """
     # Normalise text: strip trailing whitespace, append <|im_end|>\n
     response_text = response_text.rstrip()
@@ -1100,13 +1179,17 @@ def _ensure_im_end_w_new_line(response_text: str, new_tokens: list[int], new_log
         response_text += "<|im_end|>"
     response_text += "\n"
 
-    # Normalise tokens: ensure they end with [151645, 198]
-    if new_tokens[-1] != 151645:
-        new_tokens.extend([151645, 198])
-        new_logprobs.extend([0.0, 0.0])
+    # Normalise tokens: ensure they end with [<|im_end|>, \n]
+    # Tokens added here were never sampled by the policy: they carry NaN as a marker and
+    # _append_to_sample gives them loss_mask 0 / log-prob 0.0, instead of pretending the
+    # policy emitted them with probability 1 (that fabricated old log-prob put a -1 to -6 nat
+    # trainer-vs-rollout gap on the last token of every turn; see b3ft_rl2 collapse).
+    if new_tokens[-1] != _IM_END_ID:
+        new_tokens.extend([_IM_END_ID, _NEWLINE_ID])
+        new_logprobs.extend([float("nan"), float("nan")])
     else:
-        new_tokens.append(198)
-        new_logprobs.append(0.0)
+        new_tokens.append(_NEWLINE_ID)
+        new_logprobs.append(float("nan"))
     
     return response_text
 
@@ -1200,9 +1283,10 @@ def _append_to_sample(
     if len(new_tokens) != len(logprobs):
         raise ValueError("❗  new_tokens and logprobs must have the same length")
     sample.tokens.extend(new_tokens)
-    sample.loss_mask.extend([loss_mask_val] * len(new_tokens))
+    # NaN log-prob marks a token appended by _ensure_im_end_w_new_line, not sampled: never in the loss.
+    sample.loss_mask.extend([0 if (lp != lp) else loss_mask_val for lp in logprobs])
     if sample.rollout_log_probs is not None:
-        sample.rollout_log_probs.extend(logprobs)
+        sample.rollout_log_probs.extend([0.0 if (lp != lp) else lp for lp in logprobs])
 
 
 def _merge_multimodal_train_inputs(chunks: list[dict | None]) -> dict | None:
@@ -1293,9 +1377,59 @@ def _encode_with_processor(
         k: v for k, v in processor_output.items()
         if k not in ["input_ids", "attention_mask"] and isinstance(v, torch.Tensor)
     } or None
+    if multimodal_train_inputs and _MM_PIXEL_DTYPE is not None:
+        multimodal_train_inputs = {
+            k: (v.to(_MM_PIXEL_DTYPE) if v.is_floating_point() else v)
+            for k, v in multimodal_train_inputs.items()
+        }
 
 
     return token_ids, image_grid_thw, pil_images, multimodal_train_inputs
+
+# PIL decode + the VL processor cost ~80 ms per turn (rollout/step_encode_secs) and ran
+# synchronously on the one asyncio loop that also drives every browser session; at
+# ~7 turns/s across 240 sessions that alone kept the loop >50% busy and every CDP call
+# queued behind it. Both release the GIL, so a worker thread takes them off the loop.
+_ENCODE_IN_THREAD = os.environ.get("SLIME_ENCODE_IN_THREAD", "1") == "1"
+# SLIME_ENCODE_EXECUTOR=process: worker processes instead of threads. Threads still
+# contend for the GIL with the rollout loop (s9: loop_busy_frac stayed ~0.5); processes
+# only cost the pickle of the result (~11 MB bf16 pixel_values per image).
+_ENCODE_EXECUTOR_KIND = os.environ.get("SLIME_ENCODE_EXECUTOR", "thread")
+_ENCODE_WORKERS = int(os.environ.get("SLIME_ENCODE_THREADS", "8"))
+_ENCODE_POOL = None
+
+
+def _get_encode_pool(processor):
+    global _ENCODE_POOL
+    if _ENCODE_POOL is None:
+        if _ENCODE_EXECUTOR_KIND == "process":
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+
+            from slime.utils import encode_worker
+
+            _ENCODE_POOL = ProcessPoolExecutor(
+                max_workers=_ENCODE_WORKERS,
+                mp_context=multiprocessing.get_context("spawn"),
+                initializer=encode_worker.init,
+                initargs=(processor.tokenizer.name_or_path,),
+            )
+        else:
+            _ENCODE_POOL = ThreadPoolExecutor(max_workers=_ENCODE_WORKERS, thread_name_prefix="encode")
+    return _ENCODE_POOL
+
+
+async def _encode_async(processor, tokenizer, text: str, image_data: list[str]) -> tuple:
+    if not _ENCODE_IN_THREAD or not image_data:
+        return _encode_with_processor(processor, tokenizer, text, image_data)
+    loop = asyncio.get_running_loop()
+    pool = _get_encode_pool(processor)
+    if _ENCODE_EXECUTOR_KIND == "process":
+        from slime.utils import encode_worker
+
+        return await loop.run_in_executor(pool, encode_worker.encode, text, image_data)
+    return await loop.run_in_executor(pool, _encode_with_processor, processor, tokenizer, text, image_data)
+
 
 # ---------------------------------------------------------------------------
 # Sample data saving utilities
@@ -1400,6 +1534,26 @@ def _mark_remove_sample_if_needed(sample: Sample) -> Sample:
     return sample
 
 
+def _finalize_turn_samples(turn_samples: list[Sample], traj_start: float | None = None) -> list[Sample]:
+    """Common tail for both return paths of `_generate_turn_sample_impl`.
+
+    Only the is_last_turn sample is read by the judges, but every turn snapshots
+    the whole conversation + all screenshots (`messages` / `full_image_list`), so a
+    trajectory of N turns ships O(N^2) screenshots through Ray's object store --
+    that was 50-84 GB of spill per iteration. Drop the snapshots from the
+    non-last turns and stamp the trajectory wall-clock on the last one.
+    """
+    num_turns = len(turn_samples)
+    for ts in turn_samples:
+        ts.metadata["num_turns_in_trajectory"] = num_turns
+        if not ts.metadata.get("is_last_turn"):
+            ts.metadata.pop("messages", None)
+            ts.metadata.pop("full_image_list", None)
+    if traj_start is not None and turn_samples:
+        turn_samples[-1].metadata["traj_wall_secs"] = time.monotonic() - traj_start
+    return [_mark_remove_sample_if_needed(ts) for ts in turn_samples]
+
+
 def _get_env_exit_timeout_secs(args: Any) -> float:
     """Best-effort cleanup timeout for browser env.exit()."""
     timeout_secs = getattr(args, "browser_env_exit_timeout_secs", None)
@@ -1481,6 +1635,7 @@ async def _generate_trajectory_sample_impl(
         env, adapter, state, url, task_data = await _initialize_resources(args, task_id, sample.metadata)
 
         tokenizer = state.tokenizer
+        _set_im_end_id(tokenizer)
         processor = state.processor
         sampling_params = sampling_params.copy()
 
@@ -1552,7 +1707,7 @@ async def _generate_trajectory_sample_impl(
             )
 
             # 4. Compute delta (token ids) from latest user message tokens
-            user_delta, image_grid_thw, pil_images, step_mm_train = _encode_with_processor(
+            user_delta, image_grid_thw, pil_images, step_mm_train = await _encode_async(
                 processor, tokenizer, user_text_input, user_img
             )
 
@@ -1700,7 +1855,7 @@ async def _generate_trajectory_sample_impl(
 
     except Exception as e:
         _append_host_to_blacklist_if_needed(str(e))
-        logger.opt(depth=0).warning("Task {}: generate_trajectory_sample failed: {}", task_id, e, exc_info=True)
+        logger.opt(exception=True).warning("Task {}: generate_trajectory_sample failed: {}: {}", task_id, type(e).__name__, e)
         # raise ValueError(f"❗  Generation failed: {e}") from e
         sample.status = Sample.Status.ABORTED
         sample.metadata["terminate_reason"] = f"generation_error: {e}"
@@ -1760,6 +1915,7 @@ async def _generate_turn_sample_impl(
     args: Any,
     sample: Sample,
     sampling_params: dict,
+    on_env_ready: Callable[[], None] | None = None,
 ) -> list[Sample]:
     """
     Generate a multi-turn agent-environment interaction, returning one Sample per turn.
@@ -1791,14 +1947,20 @@ async def _generate_turn_sample_impl(
     mm_messages: list[dict] = []
     turn_samples: list[Sample] = []
     env = None  # initialized early so finally block can always clean up
+    traj_start = time.monotonic()
     try:
+        t0 = time.monotonic()
         env, adapter, state, url, task_data = await _initialize_resources(args, task_id, sample.metadata)
 
         tokenizer = state.tokenizer
+        _set_im_end_id(tokenizer)
         processor = state.processor
         sampling_params = sampling_params.copy()
 
         observation, info = await env.reset()
+        env_setup_secs = time.monotonic() - t0
+        if on_env_ready is not None:
+            on_env_ready()
         tools_info, policy = adapter.parse_env_info(info)
         adapter._tools_info = tools_info
         adapter._tool_parser = ToolParser(tools_info)
@@ -1808,7 +1970,12 @@ async def _generate_turn_sample_impl(
         mm_messages.clear()
         mm_messages.append({"role": "system", "content": policy})
 
-        _SCREENSHOT_PLACEHOLDER = "screenshot:\n<|vision_start|><|image_pad|><|vision_end|>"
+        _SCREENSHOT_PLACEHOLDER = (
+            IMAGE_PLACEHOLDER
+            if response_mode.name == "molmoweb"
+            else "screenshot:\n<|vision_start|><|image_pad|><|vision_end|>"
+        )
+        max_past_steps = _get_max_past_steps(args)
 
         pending_user_msg = adapter._get_latest_user_message(task_data.get("intent", ""), observation, step_id=0)
 
@@ -1826,8 +1993,9 @@ async def _generate_turn_sample_impl(
             # 2. Filter mm_messages to keep only the last K screenshots.
             #    Identify user messages that contain screenshots, then for those outside the last-K window
             #    strip the placeholder text and image_url entry so the downstream pipeline sees only K images.
+            mm_messages_window = _apply_history_window(mm_messages, max_past_steps)
             user_img_indices = [
-                i for i, msg in enumerate(mm_messages)
+                i for i, msg in enumerate(mm_messages_window)
                 if msg["role"] == "user"
                 and isinstance(msg.get("content"), list)
                 and any(item.get("type") == "image_url" for item in msg["content"])
@@ -1835,7 +2003,7 @@ async def _generate_turn_sample_impl(
             indices_to_keep = set(user_img_indices[-context_num_screenshots:])
 
             mm_messages_filtered = []
-            for i, msg in enumerate(mm_messages):
+            for i, msg in enumerate(mm_messages_window):
                 if i in user_img_indices and i not in indices_to_keep:
                     # Strip screenshot from this older user message.
                     new_content = []
@@ -1874,9 +2042,11 @@ async def _generate_turn_sample_impl(
             )
 
             # 5. Compute input tokens with image_pad correctly expanded
-            input_tokens, image_grid_thw, pil_images, mm_train = _encode_with_processor(
+            t0 = time.monotonic()
+            input_tokens, image_grid_thw, pil_images, mm_train = await _encode_async(
                 processor, tokenizer, input_text, img_list
             )
+            encode_secs = time.monotonic() - t0
 
             # Check max context length. SGLang rejects a request whose input plus
             # max_new_tokens exceeds the served context window, so reserve the
@@ -1915,8 +2085,15 @@ async def _generate_turn_sample_impl(
             turn_sample.metadata["image_grid_thw"] = image_grid_thw
             turn_sample.multimodal_inputs = {"images": img_list}
             turn_sample.multimodal_train_inputs = mm_train
+            # Per-step wall-clock split (encode / SGLang / browser) so the rollout
+            # phase can be attributed; env_setup is charged to turn 0.
+            turn_sample.metadata["step_encode_secs"] = encode_secs
+            turn_sample.metadata["step_env_secs"] = env_setup_secs if step == 0 else 0.0
+            if step == 0:
+                turn_sample.metadata["env_setup_secs"] = env_setup_secs
 
             # 7. Run inference ---------------------------------------------
+            t0 = time.monotonic()
             llm_response, new_tokens, new_logprobs, finish_type = await _run_inference_step(
                 url,
                 input_text,
@@ -1924,6 +2101,9 @@ async def _generate_turn_sample_impl(
                 img_list,
                 timeout_secs=getattr(args, "inference_step_timeout_secs", None),
             )
+            turn_sample.metadata["step_infer_secs"] = time.monotonic() - t0
+            # policy version this turn was sampled under (streaming rollout staleness)
+            turn_sample.metadata["weight_version"] = current_weight_version()
             # --------------------------------------------------------------
             if _should_sample_llm_output(args):
                 logger.info(f"Task {task_id} step {step} llm_response={llm_response[:1000]!r}")
@@ -1978,8 +2158,12 @@ async def _generate_turn_sample_impl(
             if parsed.success and len(parsed.calls) > 0:
                 actions = adapter.actions_from_parsed(parsed.calls)
 
+                t0 = time.monotonic()
                 try:
                     observation, _, terminated, _, info = await env.step(actions)
+                    turn_sample.metadata["step_env_secs"] += time.monotonic() - t0
+                    for phase, secs in (getattr(env, "last_step_timings", None) or {}).items():
+                        turn_sample.metadata[f"step_env_{phase}_secs"] = secs
                 except Exception as step_err:
                     logger.warning(f"Task {task_id} step {step}: env.step() failed, marking as ABORTED: {step_err}")
                     # raise ValueError(f"❗  Environment step failed: {step_err}") from step_err
@@ -2052,15 +2236,12 @@ async def _generate_turn_sample_impl(
             sample.metadata["total_steps"] = 0
             turn_samples = [sample]
 
-        num_turns_in_trajectory = len(turn_samples)
-        for ts in turn_samples:
-            ts.metadata["num_turns_in_trajectory"] = num_turns_in_trajectory
-
-        return [_mark_remove_sample_if_needed(ts) for ts in turn_samples]
+        return _finalize_turn_samples(turn_samples, traj_start)
 
     except Exception as e:
         _append_host_to_blacklist_if_needed(str(e))
-        logger.opt(depth=0).warning("Task {}: generate_turn_sample failed: {}", task_id, e, exc_info=True)
+        # loguru ignores exc_info=; opt(exception=True) is what prints the traceback.
+        logger.opt(exception=True).warning("Task {}: generate_turn_sample failed: {}: {}", task_id, type(e).__name__, e)
         # raise ValueError(f"❗  Generation failed: {e}") from e
         # Return a failed sample instead of crashing the whole batch.
         if turn_samples:
@@ -2083,11 +2264,7 @@ async def _generate_turn_sample_impl(
             sample.metadata["terminate_reason"] = f"generation_error: {e}"
             sample.metadata["total_steps"] = 0
             turn_samples = [sample]
-        num_turns_in_trajectory = len(turn_samples)
-        for ts in turn_samples:
-            ts.metadata["num_turns_in_trajectory"] = num_turns_in_trajectory
-
-        return [_mark_remove_sample_if_needed(ts) for ts in turn_samples]
+        return _finalize_turn_samples(turn_samples, traj_start)
     finally:
         try:
             path_to_save_generated_samples = getattr(args, "path_to_save_generated_samples", "")
@@ -2124,14 +2301,26 @@ async def generate_turn_sample(
     task_id = (sample.metadata or {}).get("task_id", "webvoyager/60")
     async with _browser_rollout_submission_slot(args, task_id):
         timeout_secs = _get_rollout_task_timeout_secs(args)
+        # Wall-clock stamps on the last turn; sglang_rollout.py dumps them per
+        # trajectory so episode duration since rollout start can be histogrammed.
+        traj_start_ts = time.time()
         try:
             if timeout_secs is not None and timeout_secs > 0:
-                return await asyncio.wait_for(
-                    _generate_turn_sample_impl(args, sample, sampling_params),
-                    timeout=timeout_secs,
-                )
-            return await _generate_turn_sample_impl(args, sample, sampling_params)
-        except asyncio.TimeoutError:
+                # The task budget starts when the browser is ready: with 240 sessions
+                # behind the Browserbase spawn throttle, setup alone takes up to ~3 min
+                # and was eating into the 480 s budget. Setup itself gets a fixed grace.
+                setup_grace = float(getattr(args, "rollout_setup_grace_secs", 300.0))
+                loop = asyncio.get_running_loop()
+                async with asyncio.timeout(setup_grace) as budget:
+                    turn_samples = await _generate_turn_sample_impl(
+                        args,
+                        sample,
+                        sampling_params,
+                        on_env_ready=lambda: budget.reschedule(loop.time() + timeout_secs),
+                    )
+            else:
+                turn_samples = await _generate_turn_sample_impl(args, sample, sampling_params)
+        except TimeoutError:
             logger.warning(f"Task {task_id}: generate_turn_sample timed out after {timeout_secs}s")
             sample.status = Sample.Status.ABORTED
             sample.metadata = sample.metadata or {}
@@ -2139,4 +2328,8 @@ async def generate_turn_sample(
             sample.metadata["turn_index"] = 0
             sample.metadata["terminate_reason"] = f"generation_error: rollout_task_timeout after {timeout_secs}s"
             sample.metadata["total_steps"] = sample.metadata.get("total_steps", 0)
-            return [_mark_remove_sample_if_needed(sample)]
+            sample.metadata["traj_wall_secs"] = float(timeout_secs)
+            turn_samples = [_mark_remove_sample_if_needed(sample)]
+        turn_samples[-1].metadata["traj_start_ts"] = traj_start_ts
+        turn_samples[-1].metadata["traj_end_ts"] = time.time()
+        return turn_samples

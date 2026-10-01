@@ -36,6 +36,18 @@ _BROWSER_RESPONSE_FORMAT_MODES: dict[str, BrowserResponseFormatMode] = {
         chat_template_enable_thinking=False,
         append_visible_thinking_prefill=True,
     ),
+    "molmoweb": BrowserResponseFormatMode(
+        name="molmoweb",
+        policy_relpath="env/prompts/system_prompt_molmoweb.md",
+        # The molmoweb SFT rows carry plain-text reasoning and no thinking tags;
+        # the checkpoint's chat template emits the empty <think></think> block
+        # itself, so nothing is prefilled or rewritten here.
+        thinking_open_tag="<think>",
+        thinking_close_tag="</think>",
+        requires_action_block=False,
+        chat_template_enable_thinking=None,
+        append_visible_thinking_prefill=False,
+    ),
 }
 
 def _get_browser_env_chat_template_enable_thinking_override() -> bool | None:

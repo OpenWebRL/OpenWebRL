@@ -28,6 +28,7 @@ from slime.utils.memory_utils import clear_memory
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
 from .loss import loss_function
+from . import attention_mask_patch, response_logits, te_backend_patch, vision_sdpa_patch
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,11 @@ def setup_model_and_optimizer(
     model = get_model(
         wrap_model_provider_with_freeze(get_model_provider_func(args, role), args), ModelType.encoder_or_decoder
     )
+    for model_chunk in model:
+        response_logits.install(model_chunk)
+    attention_mask_patch.install()
+    te_backend_patch.install()
+    vision_sdpa_patch.install()
 
     # Optimizer
     kwargs = {}
@@ -224,6 +230,9 @@ def forward_only(
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
+        response_logits.set_selection(
+            total_lengths, response_lengths, batch.get("max_seq_lens", None), tokens.device
+        )
         output_tensor = model(
             input_ids=tokens,
             position_ids=None,
@@ -379,6 +388,13 @@ def train_one_step(
             args.allgather_cp,
         )
 
+        response_logits.set_selection(
+            batch["total_lengths"],
+            batch["response_lengths"],
+            batch.get("max_seq_lens", None),
+            batch["tokens"].device,
+        )
+
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
@@ -418,6 +434,24 @@ def train_one_step(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
+    # SLIME_PROFILE_TRAIN_STEP="<rollout_id>:<step_id>" records a kernel-level torch trace of
+    # that one optimizer step (all its micro-batches) on TP/DP rank 0 and writes it to
+    # $SLIME_PROFILE_DIR. Kernels only -- no stacks or memory -- so a 27-micro-batch step
+    # is a few hundred MB, where slime's built-in whole-rollout profiler would be many GB.
+    profile_target = os.environ.get("SLIME_PROFILE_TRAIN_STEP")
+    profiler = None
+    if profile_target and torch.distributed.get_rank() == 0:
+        want_rollout, want_step = (int(x) for x in profile_target.split(":"))
+        if (rollout_id, step_id) == (want_rollout, want_step):
+            # SLIME_PROFILE_STACKS=1 also records Python call stacks, which names the
+            # call site of every host sync at the cost of a larger trace.
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=False,
+                with_stack=os.environ.get("SLIME_PROFILE_STACKS", "0") == "1",
+                profile_memory=False,
+            )
+            profiler.__enter__()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
         data_iterator=data_iterator,
@@ -428,6 +462,13 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    if profiler is not None:
+        profiler.__exit__(None, None, None)
+        out_dir = os.environ.get("SLIME_PROFILE_DIR", ".")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"train_step_r{rollout_id}_s{step_id}_rank0.json.gz")
+        profiler.export_chrome_trace(path)
+        logger.warning("wrote train-step profile to %s", path)
 
     valid_step = True
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
@@ -780,7 +821,8 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         from megatron.bridge import AutoBridge
         from slime.utils.megatron_bridge_utils import patch_megatron_model
 
-        path = Path(args.save_hf.format(rollout_id=rollout_id))
+        # {rollout_id} is 0-based; {step} = rollout_id + 1 is the number of completed steps.
+        path = Path(args.save_hf.format(rollout_id=rollout_id, step=rollout_id + 1))
 
         if should_log:
             logger.info(f"Saving model in HuggingFace format to {path}")

@@ -233,6 +233,12 @@ async def evaluate_single_task(args: EvalArgs, task: dict, sampling_params: dict
             reward = await reward_func(args, turn_samples)
             result = turn_samples[-1]
             reward = reward[-1] if isinstance(reward, list) and reward else reward
+            _timing_keys = ("step_env_secs", "step_infer_secs", "step_encode_secs", "env_setup_secs",
+                            "step_env_action_secs", "step_env_a11y_secs", "step_env_screenshot_secs",
+                            "step_env_tabs_secs", "step_env_settle_secs")
+            turn_timings = [
+                {k: ts.metadata[k] for k in _timing_keys if k in ts.metadata} for ts in turn_samples
+            ]
         else:
             print(f"Evaluating task {task_id} with task-level evaluation...")
             result = await generate_trajectory_sample(args, input_sample, sampling_params)
@@ -249,6 +255,7 @@ async def evaluate_single_task(args: EvalArgs, task: dict, sampling_params: dict
             "total_steps": result.metadata.get("total_steps", -1),
             "terminate_reason": result.metadata.get("terminate_reason", ""),
             "metadata": _to_jsonable(result.metadata),
+            "turn_timings": _to_jsonable(turn_timings) if turn_level else None,
         }
 
     task_id = task["task_id"]
@@ -468,7 +475,7 @@ def main():
         "--judge-prompt-variant",
         type=str,
         default="default",
-        choices=["default", "action_history"],
+        choices=["default", "action_history", "agenttrek", "molmoweb_om2w"],
         help="Judge prompt variant. 'action_history' adds parsed action history and inferred image step indices.",
     )
     parser.add_argument("--judge-timeout-secs", type=float, default=30.0,

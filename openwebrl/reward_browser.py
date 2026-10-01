@@ -424,6 +424,19 @@ def _compute_turn_format_reward_browser_env(args: Any, response: str) -> float:
     return 1.0 if has_think_close and has_tool_call else 0.0
 
 
+def _compute_turn_format_reward_molmoweb(response: str) -> float:
+    """molmoweb turns carry plain-text reasoning and one `computer_use` call; there are
+    no thinking tags to check (the chat template emits the empty block in the prompt),
+    so a parseable call is the whole format contract."""
+    from openwebrl.adapters.molmoweb_adapter import parse_molmoweb_output
+
+    response = response.strip()
+    if response.endswith("<|im_end|>"):
+        response = response[: -len("<|im_end|>")].rstrip()
+    _, args_dict = parse_molmoweb_output(response)
+    return 1.0 if args_dict.get("action") else 0.0
+
+
 def compute_format_reward(args: Any, response: str | None = None, turn_level: bool = False) -> float:
     """
     Compute format reward across (multiple) assistant turns in a
@@ -450,6 +463,8 @@ def compute_format_reward(args: Any, response: str | None = None, turn_level: bo
     if turn_level:
         if response_mode.name == "slime":
             return _compute_turn_format_reward_slime(args, response)
+        if response_mode.name == "molmoweb":
+            return _compute_turn_format_reward_molmoweb(response)
         return _compute_turn_format_reward_browser_env(args, response)
     
     # Extract every assistant turn: content between <|im_start|>assistant\n
@@ -463,6 +478,8 @@ def compute_format_reward(args: Any, response: str | None = None, turn_level: bo
 
     if response_mode.name == "slime":
         scores = [_compute_turn_format_reward_slime(args, turn) for turn in turns]
+    elif response_mode.name == "molmoweb":
+        scores = [_compute_turn_format_reward_molmoweb(turn) for turn in turns]
     else:
         scores = [_compute_turn_format_reward_browser_env(args, turn) for turn in turns]
     if all(s == 1.0 for s in scores):
@@ -531,10 +548,21 @@ def _extract_final_answer_browser_env(response: str) -> str:
     return ""
 
 
+def _extract_final_answer_molmoweb(response: str) -> str:
+    from openwebrl.adapters.molmoweb_adapter import parse_molmoweb_output
+
+    _, call_args = parse_molmoweb_output(response)
+    if call_args.get("action") == "terminate":
+        return str(call_args.get("answer", "")).strip()
+    return ""
+
+
 def _extract_final_answer(args: Any, response: str) -> str:
     response_mode = _get_browser_response_mode(args)
     if response_mode.name == "browser_env":
         return _extract_final_answer_browser_env(response)
+    if response_mode.name == "molmoweb":
+        return _extract_final_answer_molmoweb(response)
     return _extract_final_answer_slime(response)
 
 
@@ -891,7 +919,19 @@ def _get_openai_client(method="token") -> Any:
         return AsyncAzureOpenAI(**kwargs)
 
     if method == "served":
-        base_url = os.environ.get("JUDGE_API_BASE")
+        # Re-read the endpoint file on every call: the judge job can be preempted
+        # and come back on another node, and a base URL pinned at startup then
+        # scores every episode 0 for the rest of the run.
+        base_url = None
+        endpoint_file = os.environ.get("JUDGE_ENDPOINT_FILE")
+        if endpoint_file:
+            try:
+                with open(endpoint_file) as f:
+                    base_url = f.read().strip() or None
+            except OSError:
+                base_url = None
+        if not base_url:
+            base_url = os.environ.get("JUDGE_API_BASE")
         if not base_url:
             host = os.environ.get("JUDGE_API_HOST", "").strip()
             port = os.environ.get("JUDGE_API_PORT", "").strip()
@@ -905,6 +945,31 @@ def _get_openai_client(method="token") -> Any:
         return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     raise ValueError(f"Unsupported judge_api_mode: {method}")
+
+
+async def wait_for_judge(method: str, max_wait_secs: float | None = None, poll_secs: float = 30.0) -> bool:
+    """Block until the judge answers /v1/models again, or give up after max_wait_secs.
+
+    A preempted judge job takes minutes to come back on another node. Without this,
+    every episode in flight scores None, the dynamic-sampling filter drops every
+    group and resubmits, and the run burns browser sessions at full speed until
+    the judge returns (960 Browserbase sessions in 20 min on 2026-09-05).
+    JUDGE_OUTAGE_WAIT_SECS=0 disables the wait."""
+    if max_wait_secs is None:
+        max_wait_secs = float(os.environ.get("JUDGE_OUTAGE_WAIT_SECS", "1800"))
+    if max_wait_secs <= 0:
+        return False
+    deadline = time.monotonic() + max_wait_secs
+    while True:
+        try:
+            await asyncio.wait_for(_get_openai_client(method=method).models.list(), timeout=10.0)
+            return True
+        except Exception as e:
+            if time.monotonic() >= deadline:
+                logger.warning("Judge still unreachable after %.0fs: %s", max_wait_secs, e)
+                return False
+            logger.warning("Judge unreachable (%s); waiting %.0fs before re-checking", e, poll_secs)
+            await asyncio.sleep(poll_secs)
 
 
 async def compute_judge_reward(
@@ -1106,12 +1171,23 @@ async def compute_judge_reward_actionhistory(
 
     max_retries = 3
     saw_timeout = False
+    # A self-hosted judge (sglang) caps completions at 128 tokens by default, which cuts the
+    # rationale off before the verdict; the released judge inference uses max_new_tokens 2048.
+    # OpenAI o-series models reject max_tokens, so this stays opt-in via JUDGE_MAX_TOKENS.
+    extra_kwargs: dict[str, Any] = {}
+    if os.environ.get("JUDGE_MAX_TOKENS"):
+        extra_kwargs["max_tokens"] = int(os.environ["JUDGE_MAX_TOKENS"])
+    # The released judge inference decodes greedily; a served sglang judge otherwise samples
+    # with the checkpoint's generation_config (temperature 0.7).
+    if os.environ.get("JUDGE_TEMPERATURE"):
+        extra_kwargs["temperature"] = float(os.environ["JUDGE_TEMPERATURE"])
     for attempt in range(max_retries):
         try:
             judge_coro = client.chat.completions.create(
                 model=api_model,
                 messages=messages,
                 seed=42,
+                **extra_kwargs,
             )
             if judge_timeout_secs is not None and judge_timeout_secs > 0:
                 response = await asyncio.wait_for(judge_coro, timeout=judge_timeout_secs)
@@ -1263,6 +1339,94 @@ async def reward_func(args: Any, samples: Sample | list[Sample], **kwargs) -> fl
     return await asyncio.gather(*tasks)
 
 
+async def _judge_agenttrek(args: Any, sample: Sample) -> tuple[float, str, bool]:
+    """AgentTrek judge (openwebrl.eval.reward_online_mind2web) adapted to the RL reward contract.
+
+    ``_judge`` returns ``None`` when the call or verdict parse failed; that is
+    uninformative about the agent, so treat it like a judge timeout (sample removed).
+    """
+    # Lazy: reward_online_mind2web imports this module.
+    from openwebrl.base.utils import ToolParser
+    from openwebrl.eval._shared import _TOOLS_INFO, resolve_parser_type
+    from openwebrl.eval.reward_online_mind2web import _judge
+
+    if _get_browser_response_mode(args).name == "molmoweb":
+        # The checkpoint's model_type would select the qwen3_coder XML parser, but
+        # molmoweb rows emit Qwen2.5-style JSON `<tool_call>` blocks; the wrong parser
+        # shows the judge "(no parseable action)" for every step.
+        from openwebrl.adapters.molmoweb_adapter import MolmowebToolParser
+
+        tool_parser = MolmowebToolParser()
+    else:
+        tool_parser = ToolParser(_TOOLS_INFO, parser_type=resolve_parser_type(args.hf_checkpoint))
+    score, text, saw_timeout = await _judge(args, sample, tool_parser)
+    if score is None:
+        return 0.0, text, True
+    return float(score), text, saw_timeout
+
+
+_MW_JUDGE_POOL = None
+
+
+def _molmoweb_om2w_judge_sync(rollout_dir: str, task: str, model_name: str) -> tuple[float, str]:
+    """Run molmoweb's WebJudge_Online_Mind2Web_eval on a saved episode dir (trajectory.json +
+    images/), mirroring benchmarks/evaluate.py::judge_trajectory, and write the same
+    webjudge_online_mind2web_verdict.json the eval harness writes."""
+    import sys
+
+    mw_root = os.environ.get("MOLMOWEB_ROOT", "/weka/oe-training-default/new_peters/molmoweb-rl")
+    if mw_root not in sys.path:
+        sys.path.insert(0, mw_root)
+    from benchmarks.judges.utils import OpenaiEngine
+    from benchmarks.judges.webjudge_online_mind2web import WebJudge_Online_Mind2Web_eval
+
+    trajectory = json.load(open(os.path.join(rollout_dir, "trajectory.json")))
+    steps = [trajectory[k] for k in sorted(trajectory, key=int)]
+    images_path = [os.path.join(rollout_dir, "images", st["screenshot"]) for st in steps]
+    last_actions = [st["action"]["action_str"] for st in steps if st.get("action", {}).get("action_str")]
+    model = OpenaiEngine(model=model_name, api_key=os.getenv("OPENAI_API_KEY"))
+    messages, _text, _system_msg, record, key_points = asyncio.run(
+        WebJudge_Online_Mind2Web_eval(task=task, last_actions=last_actions, images_path=images_path,
+                                      model=model, score_threshold=3)
+    )
+    response = model.generate(messages)[0]
+    try:
+        success = "success" in response.lower().split("status:")[1]
+    except Exception:  # noqa: BLE001
+        success = False
+    thought = f"[OnlineMind2Web] Key points:\n{key_points}\n\nRecords: {record}\n\nFinal response: {response}"
+    with open(os.path.join(rollout_dir, "webjudge_online_mind2web_verdict.json"), "w") as f:
+        json.dump({"thought": thought, "verdict": "SUCCESS" if success else "FAILURE"}, f, indent=2)
+    return (1.0 if success else 0.0), thought
+
+
+async def _judge_molmoweb_om2w(args: Any, sample: Sample) -> tuple[float, str, bool]:
+    """molmoweb om2w WebJudge as the RL reward. Needs the episode saved on disk
+    (ROLLOUT_ENGINE=molmoweb with SLIME_MW_SAVE_PROB=1). Judge failures drop the sample."""
+    global _MW_JUDGE_POOL
+    rollout_dir = (sample.metadata or {}).get("mw_rollout_dir")
+    if not rollout_dir or not os.path.exists(os.path.join(rollout_dir, "trajectory.json")):
+        return 0.0, f"molmoweb_om2w judge: no saved episode dir ({rollout_dir})", True
+    if _MW_JUDGE_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _MW_JUDGE_POOL = ThreadPoolExecutor(max_workers=_REWARD_CONCURRENCY, thread_name_prefix="mw_judge")
+    model_name = getattr(args, "judge_api_model", None) or "o4-mini"
+    timeout_secs = getattr(args, "judge_timeout_secs", None) or 600.0
+    loop = asyncio.get_running_loop()
+    for attempt in range(3):
+        try:
+            fut = loop.run_in_executor(_MW_JUDGE_POOL, _molmoweb_om2w_judge_sync, rollout_dir, sample.metadata["intent"], model_name)
+            score, text = await asyncio.wait_for(fut, timeout=timeout_secs)
+            return score, text, False
+        except asyncio.TimeoutError:
+            logger.warning("molmoweb_om2w judge timed out (attempt %d/3) for %s", attempt + 1, rollout_dir)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("molmoweb_om2w judge failed (attempt %d/3) for %s: %r", attempt + 1, rollout_dir, exc)
+            await asyncio.sleep(5 * (attempt + 1))
+    return 0.0, "molmoweb_om2w judge failed after 3 attempts", True
+
+
 async def _score_single_sample(args: Any, sample: Sample) -> float:
     """Score a single sample (called in parallel by reward_func)."""
     if not isinstance(sample, Sample):
@@ -1302,6 +1466,15 @@ async def _score_single_sample(args: Any, sample: Sample) -> float:
                     trajectory_action_history_response=sample.metadata.get("trajectory_action_history_response"),
                     trajectory_action_history_text=sample.metadata.get("trajectory_action_history_text"),
                 )
+            elif judge_variant == "agenttrek":
+                # Same single-call AgentTrek prompt the om2w eval uses, so the
+                # training reward and the eval score come from one judge protocol.
+                judge_score, judge_text, judge_timeout = await _judge_agenttrek(args, sample)
+            elif judge_variant == "molmoweb_om2w":
+                # molmoweb's Online-Mind2Web WebJudge (o4-mini: key points, per-screenshot
+                # scoring, final verdict), read from the episode dir the molmoweb rollout
+                # engine saved -- the exact judge the om2w eval uses.
+                judge_score, judge_text, judge_timeout = await _judge_molmoweb_om2w(args, sample)
             else:
                 judge_score, judge_text, judge_timeout = await compute_judge_reward(args, sample)
             if judge_timeout:
@@ -1329,4 +1502,23 @@ async def _score_single_sample(args: Any, sample: Sample) -> float:
             "judge_timeout": judge_timeout,
             "judge_prompt_variant": getattr(args, "judge_prompt_variant", "default"),
         }
+        _write_molmoweb_verdict(sample)
         return combined
+
+
+def _write_molmoweb_verdict(sample: Sample) -> None:
+    """molmoweb-harness rollouts (openwebrl/generate_molmoweb.py) save each episode as a
+    molmoweb trajectory dir; drop the reward there in the shape molmoweb's judges write
+    (``<judge>_verdict.json`` with thought/verdict) plus the raw reward dict."""
+    rollout_dir = (sample.metadata or {}).get("mw_rollout_dir")
+    if not rollout_dir or not os.path.isdir(rollout_dir):
+        return
+    reward = sample.metadata.get("reward", {})
+    try:
+        with open(os.path.join(rollout_dir, "reward.json"), "w") as f:
+            json.dump({**reward, "status": str(sample.status), "terminate_reason": sample.metadata.get("terminate_reason")}, f, indent=2)
+        with open(os.path.join(rollout_dir, "webjudge_rl_verdict.json"), "w") as f:
+            json.dump({"thought": reward.get("judge_text", ""),
+                       "verdict": "SUCCESS" if reward.get("judge") == 1.0 else "FAILURE"}, f, indent=2)
+    except OSError as exc:
+        logger.warning("could not write reward to %s: %s", rollout_dir, exc)

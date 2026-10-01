@@ -41,11 +41,13 @@ browserbase:
   advanced_stealth: true        # BROWSERBASE_ADVANCED_STEALTH; Scale-plan feature
   solve_captchas: true          # BROWSERBASE_SOLVE_CAPTCHAS
   # Residential proxies are what change the egress IP -- advanced stealth alone
-  # does not. This is the setting that beats IP-reputation 403s, and it bills
-  # per GB of egress. BROWSERBASE_PROXIES=false turns it off.
-  proxies: true
+  # does not. They bill per GB of egress; off by default, BROWSERBASE_PROXIES=true opts in.
+  proxies: false
   timeout_secs: 1800            # BROWSERBASE_SESSION_TIMEOUT_S; session lifetime cap
   region: null                  # BROWSERBASE_REGION, e.g. "us-west-2"
+  # Account limits are 250 concurrent sessions and 100 creates/min; stay under both.
+  max_sessions: 240             # BROWSERBASE_MAX_SESSIONS; slot pool per process
+  spawn_per_minute: 90          # BROWSERBASE_SPAWN_PER_MINUTE; sliding-window create rate
 
 # Local subprocess-specific config (used when mode: local_process).
 # A fresh local env_server subprocess is created for each generation and

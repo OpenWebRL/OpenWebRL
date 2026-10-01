@@ -136,10 +136,25 @@ def add_sglang_arguments(parser):
     return parser
 
 
+def _sglang_arg(args, *names, default=1):
+    """Read whichever spelling the installed sglang generated.
+
+    sglang renamed ServerArgs.data_parallel_size / pipeline_parallel_size /
+    expert_parallel_size / tensor_parallel_size to dp_size / pp_size / ep_size /
+    tp_size, and these flags are generated from the field names, so the old
+    attribute simply does not exist on newer sglang.
+    """
+    for name in names:
+        value = getattr(args, name, None)
+        if value is not None:
+            return value
+    return default
+
+
 def validate_args(args):
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    args.sglang_dp_size = _sglang_arg(args, "sglang_data_parallel_size", "sglang_dp_size")
+    args.sglang_pp_size = _sglang_arg(args, "sglang_pipeline_parallel_size", "sglang_pp_size")
+    args.sglang_ep_size = _sglang_arg(args, "sglang_expert_parallel_size", "sglang_ep_size")
 
     # Compute effective TP size considering PP size
     if args.sglang_pp_size > 1:
@@ -191,7 +206,8 @@ def sglang_parse_args():
     temp_args, _ = temp_parser.parse_known_args()
     pp_size = temp_args.sglang_pp_size if temp_args.sglang_pp_size != 1 else temp_args.sglang_pipeline_parallel_size
     sglang_tp_size = temp_args.rollout_num_gpus_per_engine // pp_size
-    parser.set_defaults(sglang_tensor_parallel_size=sglang_tp_size)
+    # Both spellings: older sglang exposes --sglang-tensor-parallel-size, newer --sglang-tp-size.
+    parser.set_defaults(sglang_tensor_parallel_size=sglang_tp_size, sglang_tp_size=sglang_tp_size)
 
     args, _ = parser.parse_known_args()
     return args

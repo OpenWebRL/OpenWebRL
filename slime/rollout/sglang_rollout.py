@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import os
 import time
@@ -459,6 +460,68 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
+def _dump_wave_trajectories(args, rollout_id, all_groups, kept_groups, rollout_start_ts) -> dict[str, float]:
+    """Per-trajectory records for every group the wave ran (pre-filter), appended to
+    <save>/rollout_trajectories.jsonl, plus group-outcome counts for W&B. Browser
+    episodes are lists of turn samples; the last turn carries the trajectory
+    metadata written by openwebrl.generate_browser."""
+
+    def _last(traj):
+        return traj[-1] if isinstance(traj, list) else traj
+
+    kept = {_last(g[0]).group_index for g in kept_groups}
+    counts = {"all_zero": 0, "all_success": 0, "mixed": 0, "all_failed": 0}
+    n_traj = n_failed = n_timeout = 0
+    for group in all_groups:
+        rewards = []
+        for traj in group:
+            last = _last(traj)
+            md = last.metadata or {}
+            reward = last.get_reward_value(args) if last.reward is not None else None
+            reason = str(md.get("terminate_reason", ""))
+            n_traj += 1
+            n_failed += reward is None
+            n_timeout += "rollout_task_timeout" in reason
+            if reward is not None:
+                rewards.append(reward)
+            rec = {
+                "rollout_id": rollout_id,
+                "group_index": last.group_index,
+                "sample_index": last.index,
+                "task_id": md.get("task_id"),
+                "start_offset_secs": (md["traj_start_ts"] - rollout_start_ts) if "traj_start_ts" in md else None,
+                "end_offset_secs": (md["traj_end_ts"] - rollout_start_ts) if "traj_end_ts" in md else None,
+                "traj_wall_secs": md.get("traj_wall_secs"),
+                "env_setup_secs": md.get("env_setup_secs"),
+                "num_turns": md.get("num_turns_in_trajectory", len(traj) if isinstance(traj, list) else 1),
+                "status": str(last.status.name if hasattr(last.status, "name") else last.status),
+                "terminate_reason": reason,
+                "reward": reward,
+                "group_kept": last.group_index in kept,
+                "weight_version": md.get("weight_version"),
+                "submit_weight_version": md.get("submit_weight_version"),
+            }
+            append_progress_log(args, json.dumps(rec), filename="rollout_trajectories.jsonl")
+        if not rewards:
+            counts["all_failed"] += 1
+        elif all(r == 0 for r in rewards):
+            counts["all_zero"] += 1
+        elif all(r == 1 for r in rewards):
+            counts["all_success"] += 1
+        else:
+            counts["mixed"] += 1
+    logger.info(
+        "rollout %d wave: %d trajectories, %d failed (%d timeouts); groups all_zero=%d all_success=%d mixed=%d all_failed=%d",
+        rollout_id, n_traj, n_failed, n_timeout,
+        counts["all_zero"], counts["all_success"], counts["mixed"], counts["all_failed"],
+    )
+    out = {f"rollout/wave/groups_{k}": v for k, v in counts.items()}
+    out["rollout/wave/num_trajectories"] = n_traj
+    out["rollout/wave/num_failed"] = n_failed
+    out["rollout/wave/num_timeout"] = n_timeout
+    return out
+
+
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
@@ -492,6 +555,7 @@ async def generate_rollout_async(
     all_data = []
     do_print = True
     rollout_start = time.monotonic()
+    rollout_start_ts = time.time()
     last_progress_log = rollout_start
     pbar = tqdm(total=target_data_size, desc="Rollout generation")
 
@@ -529,15 +593,26 @@ async def generate_rollout_async(
         logger.info(line)
         append_progress_log(args, line)
 
+    single_wave = getattr(args, "rollout_single_wave", False)
+    submitted_wave = False
     while len(data) < target_data_size:
-        while state.remaining_batch_size < target_data_size:
+        while state.remaining_batch_size < target_data_size and not (single_wave and submitted_wave):
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
+            submitted_wave = True
             now = time.monotonic()
             if now - last_progress_log >= 10:
                 log_progress("submit")
                 last_progress_log = now
+
+        if single_wave and not state.pendings:
+            logger.info(
+                "rollout-single-wave: %d/%d groups survived the dynamic sampling filter; not resubmitting",
+                len(data),
+                target_data_size,
+            )
+            break
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -586,11 +661,15 @@ async def generate_rollout_async(
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
-    assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
+    if single_wave:
+        assert 0 < len(data) <= args.rollout_batch_size, f"Got {len(data)} groups, expected 1..{args.rollout_batch_size}"
+    else:
+        assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
     all_samples = sorted(
         all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
     )
+    wave_metrics = _dump_wave_trajectories(args, rollout_id, all_samples, data, rollout_start_ts)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -644,6 +723,7 @@ async def generate_rollout_async(
                     f"select_step={int(adaptive_metrics.get('rollout/adaptive_query_sampling/select_step', 0.0))}",
                 )
     metrics = metric_gatherer.collect()
+    metrics.update(wave_metrics)
     if hasattr(data_source, "get_adaptive_query_rollout_metrics"):
         metrics.update(data_source.get_adaptive_query_rollout_metrics())
 

@@ -31,7 +31,17 @@ from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
-from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data, sync_actor_critic_data
+from .data import (
+    DataIterator,
+    build_padded_micro_batches,
+    compute_micro_batch_max_seq_lens,
+    get_data_iterator,
+    log_padding_efficiency,
+    log_perf_data,
+    log_rollout_data,
+    sort_samples_by_length,
+    sync_actor_critic_data,
+)
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
@@ -509,14 +519,37 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
 
         if self.args.qkv_format == "bshd":
-            # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
-            max_seq_len = max(rollout_data["total_lengths"])
-
             # pad to reduce memory fragmentation and maybe make the computation faster
             pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
 
-            rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
+            if self.args.use_dynamic_batch_size:
+                # Micro-batches are an index schedule rather than contiguous windows,
+                # so the whole rollout shares one padded length.
+                max_seq_len = max(rollout_data["total_lengths"])
+                max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
+                rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
+            else:
+                # Static micro-batches are contiguous, so sorting by length lets each
+                # one be padded to its own longest sample instead of the rollout's.
+                # Turn-level browser samples are heavily skewed -- a mean near 2k tokens
+                # against a maximum an order of magnitude larger -- so padding everything
+                # to the global maximum was throwing away most of the training compute.
+                dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
+                sort_samples_by_length(self.args, rollout_data, dp_size)
+
+                token_budget = int(os.environ.get("SLIME_BSHD_TOKEN_BUDGET", "0") or 0)
+                if token_budget > 0:
+                    # Budget padded tokens instead of sample count, so short turns
+                    # pack together and only the long tail runs one at a time.
+                    indices, max_seq_lens, per_step = build_padded_micro_batches(
+                        self.args, rollout_data, dp_size, pad_size, token_budget
+                    )
+                    rollout_data["max_seq_lens"] = max_seq_lens
+                    rollout_data["micro_batch_indices"] = indices
+                    rollout_data["num_microbatches_per_step"] = per_step
+                else:
+                    rollout_data["max_seq_lens"] = compute_micro_batch_max_seq_lens(self.args, rollout_data, pad_size)
+                log_padding_efficiency(self.args, rollout_data)
 
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
@@ -1055,7 +1088,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if force_sync and self.args.async_save:
             maybe_finalize_async_save(blocking=True)
 
-        if self.args.save_hf is not None and self.role == "actor":
+        # SLIME_SAVE_HF_INTERVAL=N exports HuggingFace weights only every N completed steps
+        # (must be a multiple of --save-interval); unset = at every Megatron save.
+        hf_every = int(os.environ.get("SLIME_SAVE_HF_INTERVAL", "0") or 0)
+        if (
+            self.args.save_hf is not None
+            and self.role == "actor"
+            and (hf_every <= 0 or (rollout_id + 1) % hf_every == 0)
+        ):
             from slime.backends.megatron_utils.model import save_hf_model
 
             save_hf_model(self.args, rollout_id, self.model)

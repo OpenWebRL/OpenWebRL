@@ -20,14 +20,18 @@ Usage:
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any
+
+import openai
 
 from openwebrl.base.utils import ToolParser
 from openwebrl.eval._shared import _TOOLS_INFO, resolve_parser_type
 from openwebrl.reward_browser import (
     _get_openai_client,
     _reward_semaphore,
+    wait_for_judge,
 )
 from slime.utils.types import Sample
 
@@ -79,7 +83,12 @@ _THINK_PATTERN = re.compile(r"(?:<think>)?(.*?)</think>", re.DOTALL)
 
 def _extract_thought(content: str) -> str:
     m = _THINK_PATTERN.search(content)
-    return m.group(1).strip() if m else ""
+    if m:
+        return m.group(1).strip()
+    # Non-thinking checkpoints (the molmoweb format) write their reasoning as plain
+    # text before the tool call, with no tags to find it by.
+    head = content.split("<tool_call>", 1)[0].strip()
+    return head
 
 
 def _format_action(name: str, params: Any) -> str:
@@ -190,13 +199,22 @@ async def _judge(args: Any, sample: Sample, tool_parser: ToolParser) -> tuple[fl
 
     api_model = getattr(args, "judge_api_model")
     timeout_secs = getattr(args, "judge_timeout_secs", 120.0)
-    client = _get_openai_client(method=getattr(args, "judge_api_mode", "token"))
+    judge_api_mode = getattr(args, "judge_api_mode", "token")
     max_retries = 4
     saw_timeout = False
-    for attempt in range(max_retries):
+    # A self-hosted judge (sglang) caps completions at 128 tokens by default, which
+    # truncates the reasoning before the "Status:" line. OpenAI models keep their own
+    # default (o-series rejects max_tokens), so this is opt-in via JUDGE_MAX_TOKENS.
+    extra_kwargs: dict[str, Any] = {}
+    if os.environ.get("JUDGE_MAX_TOKENS"):
+        extra_kwargs["max_tokens"] = int(os.environ["JUDGE_MAX_TOKENS"])
+    attempt = -1
+    while (attempt := attempt + 1) < max_retries:
         try:
+            # Built per attempt so a served judge that moved nodes is picked up mid-retry.
+            client = _get_openai_client(method=judge_api_mode)
             coro = client.chat.completions.create(
-                model=api_model, messages=llm_messages, seed=42,
+                model=api_model, messages=llm_messages, seed=42, **extra_kwargs,
             )
             resp = await (asyncio.wait_for(coro, timeout=timeout_secs) if timeout_secs else coro)
             text = resp.choices[0].message.content or ""
@@ -219,6 +237,10 @@ async def _judge(args: Any, sample: Sample, tool_parser: ToolParser) -> tuple[fl
             )
             if attempt < max_retries - 1:
                 await asyncio.sleep(3 ** (attempt + 1))
+            elif isinstance(e, openai.APIConnectionError) and await wait_for_judge(judge_api_mode):
+                # Judge outage (preempted job) rather than a bad request: it is back
+                # now, give this trajectory one more attempt instead of a None.
+                max_retries += 1
             else:
                 return None, "All judge API retry attempts exhausted.", saw_timeout
 

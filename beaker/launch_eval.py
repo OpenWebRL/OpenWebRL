@@ -100,7 +100,8 @@ def main():
     p.add_argument("--bench", default="all", choices=BENCHES + ("all",))
     p.add_argument("--image", default=os.environ.get("BEAKER_IMAGE", "peters/openwebrl-train"))
     p.add_argument("--script", default="beaker/run_eval.sh")
-    p.add_argument("--cluster", default="ai2/jupiter")
+    p.add_argument("--cluster", action="append", default=None,
+                   help="Beaker cluster; repeatable (default ai2/jupiter)")
     p.add_argument("--budget", default="ai2/oe-omai")
     p.add_argument("--workspace", default="ai2/general-tool-use")
     p.add_argument("--gpus", type=int, default=8)
@@ -112,7 +113,7 @@ def main():
                    choices=("local_process", "sandbox", "browserbase", "browser-use"),
                    help="Browser env mode. 'sandbox' uses Orchard pods; 'browser-use' uses the "
                         "paper's Browser-Use Stealth Browsers; 'browserbase' uses Browserbase "
-                        "stealth browsers with residential proxies.")
+                        "stealth browsers (1280x720, proxies off).")
     p.add_argument("--browser-use-key-secret", default="MOLMOWEB_BROWSERUSE",
                    help="Beaker secret holding the Browser-Use API key.")
     p.add_argument("--browser-use-max-concurrency", type=int, default=25,
@@ -133,10 +134,23 @@ def main():
                    help="Disable advanced stealth. Stealth renders 1280x720 whatever "
                         "viewport is requested, so this is the only way to get the "
                         "configured 1280x1000 -- at the cost of anti-bot fingerprinting.")
-    p.add_argument("--no-browserbase-proxies", dest="browserbase_proxies",
-                   action="store_false",
-                   help="Disable Browserbase residential proxies (they bill per GB, but they "
-                        "are what changes the egress IP -- stealth alone does not).")
+    p.add_argument("--browserbase-proxies", dest="browserbase_proxies",
+                   action="store_true", default=False,
+                   help="Enable Browserbase residential proxies. Off by default (standing "
+                        "rule); they bill per GB.")
+    p.add_argument("--task-file", default="",
+                   help="Task JSONL relative to the repo root; overrides the benchmark default "
+                        "(protocol/judge still come from --bench).")
+    p.add_argument("--max-steps", type=int, default=0,
+                   help="Browser step budget. 0 keeps the repo default of 30; only lower it "
+                        "deliberately, e.g. a pilot matching stage-1 RL rollouts at 15.")
+    p.add_argument("--temperature", type=float, default=None,
+                   help="Override the score-mode sampling temperature (e.g. 0.8 to mimic RL rollouts).")
+    p.add_argument("--judge-endpoint-file", default="",
+                   help="Weka file where beaker/run_judge_server.sh publishes its URL; selects a "
+                        "self-hosted judge instead of the OpenAI API. Needs --judge-model.")
+    p.add_argument("--judge-model", default="",
+                   help="Judge model name (served model id for a self-hosted judge).")
     p.add_argument("--task-indices", default="",
                    help="Comma-separated row indices of the task file to evaluate; empty runs "
                         "the whole benchmark. Subset runs get their own output tree.")
@@ -153,6 +167,8 @@ def main():
                    help="Git ref to report to gantry. The job reads code from the Weka mount, "
                         "so this is provenance only -- useful when HEAD in a shared checkout "
                         "carries another session's unpushed commits.")
+    p.add_argument("--extra-env", action="append", default=[], metavar="KEY=VAL",
+                   help="Additional env var for run_eval.sh (repeatable), e.g. EVAL_TOP_P=1.0.")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
@@ -165,7 +181,7 @@ def main():
             "--budget", args.budget,
             "--workspace", args.workspace,
             "--priority", args.priority,
-            "--cluster", args.cluster,
+            *[a for c in (args.cluster or ["ai2/jupiter"]) for a in ("--cluster", c)],
             "--min-runtime", args.min_runtime,
             "--gpus", str(args.gpus),
             "--shared-memory", "100GiB",
@@ -183,6 +199,15 @@ def main():
             *(["--env", "EVAL_SCORE_MODE=" + args.score_mode] if args.score_mode else []),
             *(["--env", "TASK_INDICES=" + args.task_indices] if args.task_indices else []),
             *(["--env", "RUN_TAG=" + args.run_tag] if args.run_tag else []),
+            *(["--env", "TASK_FILE=" + args.task_file] if args.task_file else []),
+            *(["--env", f"BROWSER_MAX_STEPS={args.max_steps}"] if args.max_steps else []),
+            *(["--env", f"EVAL_TEMPERATURE={args.temperature}"] if args.temperature is not None else []),
+            # Self-hosted judge: cross-job traffic goes to the judge node's IP, which
+            # is only guaranteed routable pod->node with host networking on both sides.
+            *(["--env", "JUDGE_ENDPOINT_FILE=" + args.judge_endpoint_file, "--host-networking"]
+              if args.judge_endpoint_file else []),
+            *(["--env", "JUDGE_MODEL=" + args.judge_model] if args.judge_model else []),
+            *(a for kv in args.extra_env for a in ("--env", kv)),
             *(["--ref", args.ref] if args.ref else []),
             "--no-python",
             "--allow-dirty",

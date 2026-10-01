@@ -479,8 +479,15 @@ def get_data_iterator(
         return data_iterator
 
     if not args.use_dynamic_batch_size:
-        num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
-        data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
+        precomputed = rollout_data.get("micro_batch_indices")
+        if precomputed is not None:
+            # Variable-size micro-batches under a padded-token budget, built in
+            # _materialize_rollout_data where the padded lengths are decided.
+            num_microbatches = list(rollout_data["num_microbatches_per_step"])
+            data_iterator = _generate_data_iterator(rollout_data, None, precomputed)
+        else:
+            num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
+            data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
     else:
         assert args.max_tokens_per_gpu is not None
         # calculate the number of mirobatches for each step
@@ -560,6 +567,8 @@ def log_rollout_data(
                 "sample_indices",
                 "rollout_routed_experts",
                 "max_seq_lens",
+                "micro_batch_indices",
+                "num_microbatches_per_step",
                 "effective_global_batch_size",
                 "dynamic_global_batch_size",
             ]:
@@ -807,3 +816,191 @@ def sync_actor_critic_data(
             if v is not None
         }
     )
+
+
+def get_local_global_batch_size(args: Namespace, rollout_data: "RolloutBatch", dp_size: int) -> int:
+    """Samples this rank contributes to one optimizer step.
+
+    Mirrors the arithmetic in :func:`get_data_iterator` so that callers which need
+    the optimizer-step boundaries before the iterator exists agree with it.
+    """
+    global_batch_size = (
+        rollout_data.get("effective_global_batch_size")
+        or rollout_data.get("dynamic_global_batch_size")
+        or args.global_batch_size
+    )
+    return max(1, global_batch_size // dp_size)
+
+
+# Fields of a rollout batch that are not one entry per sample.
+_NON_PER_SAMPLE_KEYS = frozenset(
+    {
+        "effective_global_batch_size",
+        "dynamic_global_batch_size",
+        "partition",
+        "max_seq_lens",
+        "micro_batch_indices",
+        "num_microbatches_per_step",
+    }
+)
+
+
+def sort_samples_by_length(args: Namespace, rollout_data: "RolloutBatch", dp_size: int) -> None:
+    """Order each optimizer step's samples by length, in place.
+
+    ``bshd`` pads every sample in a micro-batch to the longest one in it, so the
+    cost of a micro-batch is set by its longest member. Sorting by length groups
+    similar lengths together and collapses that padding. The sort stays inside one
+    optimizer step's window so it does not change which samples land in which
+    update -- only their order within it.
+    """
+    total_lengths = rollout_data.get("total_lengths")
+    if not total_lengths:
+        return
+    num_samples = len(total_lengths)
+    num_local_gbs = get_local_global_batch_size(args, rollout_data, dp_size)
+
+    order: list[int] = []
+    for start in range(0, num_samples, num_local_gbs):
+        window = range(start, min(start + num_local_gbs, num_samples))
+        order.extend(sorted(window, key=lambda i: total_lengths[i]))
+
+    if order == list(range(num_samples)):
+        return
+
+    for key, val in list(rollout_data.items()):
+        if key in _NON_PER_SAMPLE_KEYS:
+            continue
+        if isinstance(val, list) and len(val) == num_samples:
+            rollout_data[key] = [val[i] for i in order]
+
+
+def compute_micro_batch_max_seq_lens(args: Namespace, rollout_data: "RolloutBatch", pad_size: int) -> list[int]:
+    """Per-sample padded length for ``bshd``, taken over the sample's own micro-batch.
+
+    Padding the whole rollout to its single longest sample makes every micro-batch
+    cost what the worst one costs. Static micro-batches are contiguous windows of
+    ``micro_batch_size`` (see :class:`DataIterator`), so each window only has to be
+    padded to its own longest member.
+    """
+    total_lengths = rollout_data["total_lengths"]
+    num_samples = len(total_lengths)
+    micro_batch_size = max(1, args.micro_batch_size)
+
+    max_seq_lens = [0] * num_samples
+    for start in range(0, num_samples, micro_batch_size):
+        end = min(start + micro_batch_size, num_samples)
+        padded = max(total_lengths[start:end])
+        padded = (padded + pad_size - 1) // pad_size * pad_size
+        for i in range(start, end):
+            max_seq_lens[i] = padded
+    return max_seq_lens
+
+
+def log_padding_efficiency(args: Namespace, rollout_data: "RolloutBatch") -> None:
+    """Report how much of each padded micro-batch is real tokens."""
+    if mpu.get_data_parallel_rank(with_context_parallel=False) != 0 or not mpu.is_pipeline_last_stage():
+        return
+    total_lengths = rollout_data["total_lengths"]
+    max_seq_lens = rollout_data["max_seq_lens"]
+    if not total_lengths:
+        return
+    real = sum(total_lengths)
+    padded = sum(max_seq_lens)
+    ordered = sorted(total_lengths)
+    logger.info(
+        "bshd padding: %d samples, real tokens %d, padded tokens %d (%.2fx), "
+        "seqlen mean %d p50 %d p99 %d max %d, micro_batch_size %d",
+        len(total_lengths),
+        real,
+        padded,
+        padded / max(1, real),
+        real // len(total_lengths),
+        ordered[len(ordered) // 2],
+        ordered[min(len(ordered) - 1, int(len(ordered) * 0.99))],
+        ordered[-1],
+        args.micro_batch_size,
+    )
+
+
+def build_padded_micro_batches(
+    args: Namespace,
+    rollout_data: "RolloutBatch",
+    dp_size: int,
+    pad_size: int,
+    token_budget: int,
+) -> tuple[list[list[int]], list[int], list[int]]:
+    """Length-sorted micro-batches under a budget on *padded* tokens.
+
+    A bshd micro-batch of ``k`` samples padded to ``L`` costs ``k * L`` tokens no
+    matter how long its samples really are. One fixed ``k`` therefore has to be
+    small enough for the longest sample in the rollout, which leaves the GPU idle
+    on the short ones -- and browser turns are mostly short. Budgeting ``k * L``
+    over length-sorted samples instead packs many short samples together and lets
+    the long tail sit alone.
+
+    Expects ``rollout_data`` to already be sorted by :func:`sort_samples_by_length`.
+
+    Returns ``(micro_batch_indices, max_seq_lens, num_microbatches_per_step)``.
+    """
+    total_lengths = rollout_data["total_lengths"]
+    num_samples = len(total_lengths)
+    num_local_gbs = get_local_global_batch_size(args, rollout_data, dp_size)
+    num_steps = num_samples // num_local_gbs
+
+    def padded(length: int) -> int:
+        return (length + pad_size - 1) // pad_size * pad_size
+
+    def cost(group: list[int]) -> int:
+        return len(group) * padded(max(total_lengths[i] for i in group))
+
+    steps: list[list[list[int]]] = []
+    for step in range(num_steps):
+        start = step * num_local_gbs
+        window = list(range(start, start + num_local_gbs))
+        groups: list[list[int]] = []
+        current: list[int] = []
+        current_max = 0
+        for idx in window:
+            candidate_max = max(current_max, padded(total_lengths[idx]))
+            if current and (len(current) + 1) * candidate_max > token_budget:
+                groups.append(current)
+                current, current_max = [idx], padded(total_lengths[idx])
+            else:
+                current.append(idx)
+                current_max = candidate_max
+        if current:
+            groups.append(current)
+        steps.append(groups)
+
+    # Every DP rank must run the same number of micro-batches, or the gradient
+    # all-reduces issued during backward do not line up.
+    counts = torch.tensor([len(g) for g in steps], dtype=torch.int, device=torch.cuda.current_device())
+    if dist.is_initialized() and dp_size > 1:
+        dist.all_reduce(counts, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group(with_context_parallel=False))
+    targets = counts.tolist()
+
+    for step, target in enumerate(targets):
+        groups = steps[step]
+        # Only ever split, never merge: the target is the DP-wide maximum, and a
+        # window of N samples can always be cut into at most N groups.
+        while len(groups) < target:
+            splittable = [j for j, g in enumerate(groups) if len(g) > 1]
+            if not splittable:
+                break
+            j = max(splittable, key=lambda j: cost(groups[j]))
+            group = groups[j]
+            half = len(group) // 2
+            groups[j : j + 1] = [group[:half], group[half:]]
+        steps[step] = groups
+
+    micro_batch_indices: list[list[int]] = []
+    max_seq_lens = [padded(length) for length in total_lengths]
+    for groups in steps:
+        for group in groups:
+            group_max = padded(max(total_lengths[i] for i in group))
+            for i in group:
+                max_seq_lens[i] = group_max
+            micro_batch_indices.append(group)
+
+    return micro_batch_indices, max_seq_lens, [len(g) for g in steps]

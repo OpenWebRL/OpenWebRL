@@ -18,6 +18,88 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Post-action settle = bounded networkidle wait + fixed pause. At 240 concurrent
+# Browserbase sessions most pages never go idle, so the defaults (5 s + 1 s) were
+# ~6 of the ~11 s per action; the sweep overrides them via env.
+_NETWORKIDLE_TIMEOUT_MS = int(float(os.environ.get("SLIME_BROWSER_NETWORKIDLE_TIMEOUT_MS", "5000")))
+_POST_ACTION_WAIT_MS = int(float(os.environ.get("SLIME_BROWSER_POST_ACTION_WAIT_MS", "1000")))
+
+# Fast step path (default on; SLIME_BROWSER_FAST_STEP=0 restores the timer-based
+# path): replace the networkidle+sleep settle with a readiness check, skip the unused
+# a11y walk, fetch the observation concurrently, and take the screenshot over raw CDP.
+# See docs/FAST_BROWSER_STEP.md for the measurements.
+_FAST_STEP = os.environ.get("SLIME_BROWSER_FAST_STEP", "0").strip().lower() in {"1", "true", "yes", "on"}
+_SETTLE_MAX_MS = int(float(os.environ.get("SLIME_BROWSER_SETTLE_MAX_MS", "3000")))
+_SETTLE_QUIET_MS = int(float(os.environ.get("SLIME_BROWSER_SETTLE_QUIET_MS", "300")))
+# PNG keeps the model input identical to the old page.screenshot() path; jpeg is ~2x faster still.
+_FAST_SCREENSHOT_FORMAT = os.environ.get("SLIME_BROWSER_FAST_SCREENSHOT_FORMAT", "png").strip().lower()
+_FAST_SCREENSHOT_QUALITY = int(os.environ.get("SLIME_BROWSER_FAST_SCREENSHOT_QUALITY", "80"))
+# A click's navigation starts asynchronously; without this grace the readiness check
+# passes on the OLD document and the model sees a stale page (measured: 7 `wait`
+# actions and 15 extra steps over 5 tasks). Scroll never navigates and skips it.
+_NAV_GRACE_MS = int(float(os.environ.get("SLIME_BROWSER_NAV_GRACE_MS", "500")))
+# A request younger than this still counts as "content loading"; older in-flight
+# requests are treated as long-polls/streams and ignored (unlike networkidle).
+_YOUNG_REQUEST_MS = int(float(os.environ.get("SLIME_BROWSER_YOUNG_REQUEST_MS", "1500")))
+# While document.readyState is still "loading"/"interactive" the page is genuinely
+# mid-load, so the wait may run this long (a blank page is the worst outcome).
+_SETTLE_LOAD_MAX_MS = int(float(os.environ.get("SLIME_BROWSER_SETTLE_LOAD_MAX_MS", "10000")))
+# Optional audit: dump every step's screenshot + settle report here (fast path only).
+_DUMP_SHOTS_DIR = os.environ.get("SLIME_BROWSER_DUMP_SHOTS_DIR", "")
+
+# Resolves once the page is actually rendered: document complete, fonts loaded, every
+# <img> intersecting the viewport decoded, no resource finished in the last quietMs
+# (long-polls never finish, so unlike networkidle they do not block), and the DOM
+# signature unchanged for two 50 ms polls. Bounded by maxMs.
+_READY_JS = """
+([maxMs, quietMs, youngMs]) => new Promise(res => {
+    // In-page tracker for same-site fetch/XHR (content loads). Installed lazily here
+    // and via add_init_script for new documents; costs the controller nothing.
+    if (!window.__owrl) {
+        const o = window.__owrl = {inflight: new Map(), seq: 0};
+        const same = u => { try { const h = new URL(u, location.href).hostname;
+            return h.split('.').slice(-2).join('.') === location.hostname.split('.').slice(-2).join('.'); } catch (e) { return false; } };
+        const of = window.fetch;
+        if (of) window.fetch = function(input) { const u = typeof input === 'string' ? input : (input && input.url) || '';
+            if (!same(u)) return of.apply(this, arguments);
+            const id = ++o.seq; o.inflight.set(id, performance.now());
+            return of.apply(this, arguments).finally(() => o.inflight.delete(id)); };
+        const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(m, u) { this.__owrl_same = same(u); return oo.apply(this, arguments); };
+        XMLHttpRequest.prototype.send = function() { if (this.__owrl_same) { const id = ++o.seq; o.inflight.set(id, performance.now());
+            this.addEventListener('loadend', () => o.inflight.delete(id)); } return os.apply(this, arguments); };
+    }
+    const t0 = performance.now();
+    let last = null, stable = 0, polls = 0;
+    const lastRes = () => { const e = performance.getEntriesByType('resource'); return e.length ? e[e.length-1].responseEnd : 0; };
+    const inView = el => { const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth; };
+    const young = () => { const now = performance.now(); for (const t of window.__owrl.inflight.values()) if (now - t < youngMs) return true; return false; };
+    const ready = () => {
+        if (document.readyState !== 'complete') return 'readyState';
+        if (document.fonts && document.fonts.status !== 'loaded') return 'fonts';
+        for (const img of document.images) if (inView(img) && !img.complete) return 'img';
+        if (youngMs > 0 && young()) return 'xhr';
+        if (quietMs > 0 && performance.now() - lastRes() < quietMs) return 'net';
+        return null;
+    };
+    const sig = () => document.documentElement.scrollHeight + ':' + document.getElementsByTagName('*').length + ':' + scrollY + ':' + document.images.length;
+    const tick = () => {
+        polls++;
+        const s = sig(); stable = (s === last) ? stable + 1 : 0; last = s;
+        const why = ready();
+        if ((!why && stable >= 2) || performance.now() - t0 > maxMs)
+            return res({ms: Math.round(performance.now() - t0), blocked_on: why, stable, polls});
+        setTimeout(tick, 50);
+    };
+    tick();
+})"""
+
+# Same tracker for documents created after the first one (installed once per context).
+_TRACKER_INIT_JS = _READY_JS.split("const t0 = performance.now();")[0].replace("([maxMs, quietMs, youngMs]) => new Promise(res => {", "(() => {") + "})();"
+
+
+
 class WebEnv(BaseEnv):
     """
     Web environment for browser interaction using Playwright.
@@ -425,8 +507,29 @@ class WebEnv(BaseEnv):
         Returns:
             Screenshot as bytes
         """
+        if _FAST_STEP:
+            return await self._cdp_screenshot()
         screenshot_bytes = await self.page.screenshot(timeout=self.screenshot_timeout)
         return screenshot_bytes
+
+    async def _cdp_screenshot(self) -> ByteString:
+        """Fast path: Page.captureScreenshot with optimizeForSpeed (0.66 s -> 0.11 s remote)."""
+        import base64
+        sess = getattr(self, "_cdp_sessions", None)
+        if sess is None:
+            sess = self._cdp_sessions = {}
+        cdp = sess.get(self.page)
+        if cdp is None:
+            cdp = sess[self.page] = await self.context.new_cdp_session(self.page)
+        params = {"format": _FAST_SCREENSHOT_FORMAT, "optimizeForSpeed": True}
+        if _FAST_SCREENSHOT_FORMAT == "jpeg":
+            params["quality"] = _FAST_SCREENSHOT_QUALITY
+        try:
+            r = await cdp.send("Page.captureScreenshot", params)
+        except Exception:
+            sess.pop(self.page, None)  # page navigated/closed; fall back once
+            return await self.page.screenshot(timeout=self.screenshot_timeout)
+        return base64.b64decode(r["data"])
 
     def get_all_tabs(self) -> List:
         """
@@ -893,6 +996,7 @@ class WebEnv(BaseEnv):
         """
         action_type = action["name"]
         parameters = action.get("args", {})
+        self._action_t0 = time.monotonic()
         try:
             # Convert absolute coordinates -> CSS Viewport coordinates for point_2d format
             if "point_2d" in parameters and parameters["point_2d"] is not None:
@@ -947,6 +1051,86 @@ class WebEnv(BaseEnv):
         except Exception as e:
             return False, f"Error occurred when parsing actions in the environment: {e}"
 
+    async def _settle_after_action(self) -> None:
+        """Bounded networkidle wait, then a fixed pause (see module constants)."""
+        if _FAST_STEP:
+            await self._settle_until_ready()
+            return
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=_NETWORKIDLE_TIMEOUT_MS)
+        except Exception:
+            pass  # Page may never reach networkidle (e.g., long-polling)
+        await self.page.wait_for_timeout(_POST_ACTION_WAIT_MS)
+
+    async def _install_tracker(self) -> None:
+        """Install the in-page fetch/XHR tracker for future documents (once per context)."""
+        ctx = self.context
+        if ctx is None or getattr(self, "_tracker_ctx", None) is ctx:
+            return
+        try:
+            await ctx.add_init_script(_TRACKER_INIT_JS)
+        except Exception as exc:
+            logger.warning("add_init_script failed: %s", exc)
+        self._tracker_ctx = ctx
+
+    async def _settle_until_ready(self, may_navigate: bool = True) -> None:
+        """Fast path: wait for the page to be rendered instead of sleeping on timers.
+
+        Everything is event-driven or in-page so the single rollout controller does
+        at most three round trips per action and no polling:
+        1. `expect_navigation(commit)` for up to the grace window catches a
+           click-triggered navigation that has not started or committed yet
+           (the old document would otherwise pass the check);
+        2. `wait_for_load_state("load")` (instant when nothing is loading);
+        3. one `evaluate` that waits in the page until the document is complete,
+           fonts loaded, viewport images decoded, no young same-site fetch/XHR,
+           no resource finished for quietMs, and the DOM stable for two polls.
+        """
+        await self._install_tracker()
+        t_start = time.monotonic()
+        navigated = False
+        # Phase A: navigation. Give a click-triggered navigation the grace window to
+        # commit, then wait for the (new) document's load event.
+        if may_navigate and _NAV_GRACE_MS > 0:
+            try:
+                async with self.page.expect_navigation(wait_until="commit", timeout=_NAV_GRACE_MS):
+                    pass
+                navigated = True
+            except Exception:
+                pass  # no navigation within the grace window
+        try:
+            await self.page.wait_for_load_state("load", timeout=_SETTLE_LOAD_MAX_MS)
+        except Exception:
+            pass
+        # Phase B: content. Its own budget, so a slow navigation does not eat it.
+        t_b = time.monotonic()
+        deadline = t_b + _SETTLE_MAX_MS / 1000.0
+        hard_deadline = t_b + _SETTLE_LOAD_MAX_MS / 1000.0
+        for _ in range(12):
+            remaining_ms = max(200, int((deadline - time.monotonic()) * 1000))
+            try:
+                rep = await self.page.evaluate(_READY_JS, [remaining_ms, _SETTLE_QUIET_MS, _YOUNG_REQUEST_MS])
+                rep["navigated"] = navigated
+                rep["nav_ms"] = int((t_b - t_start) * 1000)
+                rep["total_ms"] = int((time.monotonic() - t_start) * 1000)
+                self.last_settle_report = rep
+                # Content genuinely still arriving (document loading or same-site
+                # fetch/XHR in flight): keep waiting, up to the longer load cap.
+                if rep.get("blocked_on") in ("readyState", "xhr") and time.monotonic() < hard_deadline:
+                    deadline = min(hard_deadline, time.monotonic() + _SETTLE_MAX_MS / 1000.0)
+                    await asyncio.sleep(0.2)
+                    continue
+                return
+            except Exception as exc:  # document replaced mid-check: wait for the new one
+                self.last_settle_report = {"error": str(exc)[:80]}
+                if time.monotonic() > hard_deadline:
+                    return
+                try:
+                    await self.page.wait_for_load_state("load", timeout=max(200, int((hard_deadline - time.monotonic()) * 1000)))
+                except Exception:
+                    pass
+                deadline = min(hard_deadline, time.monotonic() + _SETTLE_MAX_MS / 1000.0)
+
     async def _execute_click(self, parameters: Dict[str, Any]) -> tuple[bool, str]:
         """
         Click at specified position.
@@ -974,11 +1158,7 @@ class WebEnv(BaseEnv):
             pre_tab_count = len(self.context.pages) if self.context else 0
 
             await self.page.mouse.click(x, y, button=button, click_count=clicks)
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass  # Page may never reach networkidle (e.g., long-polling)
-            await self.page.wait_for_timeout(1000)
+            await self._settle_after_action()
 
             target = f" on {elem_desc}" if elem_desc else ""
             feedback = f"Succeed: `click`{target} at ({x:.0f}, {y:.0f}) executed."
@@ -1014,16 +1194,31 @@ class WebEnv(BaseEnv):
             elem_desc = await self._get_focused_element_description()
             pre_url = self.page.url
 
+            # Ctrl+A on a non-editable focus target selects the whole page and the
+            # text goes nowhere (~20% of writes in eval). Refuse instead.
+            try:
+                editable = await self.page.evaluate(
+                    """() => { const el = document.activeElement; if (!el) return false;
+                        const tag = el.tagName.toLowerCase();
+                        if (tag === 'textarea' || tag === 'select') return true;
+                        if (tag === 'input') return !['button','submit','reset','checkbox','radio','file','image','range','color','hidden'].includes((el.type||'text').toLowerCase());
+                        return el.isContentEditable || el.getAttribute('role') === 'textbox' || el.getAttribute('role') === 'combobox' || el.getAttribute('role') === 'searchbox'; }"""
+                )
+            except Exception:
+                editable = True  # cannot tell; keep the old behaviour
+            if not editable:
+                return False, (
+                    f"Failed: `write` skipped because no text field is focused"
+                    f"{(' (focus is on ' + elem_desc + ')') if elem_desc else ''}. "
+                    "Click on the input field first, then write."
+                )
+
             # Clear existing content first
             await self.page.keyboard.press("Control+A")
             await self.page.keyboard.press("Backspace")
 
             await self.page.keyboard.type(message)
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            await self.page.wait_for_timeout(1000)
+            await self._settle_after_action()
 
             target = f" into {elem_desc}" if elem_desc else ""
             feedback = f"Succeed: `write` typed \"{message}\"{target}."
@@ -1118,11 +1313,10 @@ class WebEnv(BaseEnv):
             else:
                 await self.page.evaluate(f"window.scrollBy({delta_x}, {delta_y});")
 
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            await self.page.wait_for_timeout(1000)
+            if _FAST_STEP:
+                await self._settle_until_ready(may_navigate=False)
+            else:
+                await self._settle_after_action()
             target = f" at ({point_2d[0]}, {point_2d[1]})" if point_2d else ""
             feedback = f"Succeed: `scroll` {direction} by {amount:.0%}{target} executed."
             post_scroll = await self.page.evaluate("() => ({x: window.scrollX, y: window.scrollY})")
@@ -1185,11 +1379,7 @@ class WebEnv(BaseEnv):
                         if len(legal_keys) > 1:
                             await self.page.wait_for_timeout(100)
 
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            await self.page.wait_for_timeout(1000)
+            await self._settle_after_action()
             feedback = f"Succeed: `press_keys` {legal_keys} executed."
             post_url = self.page.url
             if post_url != pre_url:
@@ -1242,11 +1432,7 @@ class WebEnv(BaseEnv):
         """
         try:
             await self.page.go_back()
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
-            await self.page.wait_for_timeout(1000)
+            await self._settle_after_action()
             return True, "Succeed: `go_back` executed."
         except Exception as e:
             return False, f"Failed: `go_back` execution failed: {e}"
@@ -1328,6 +1514,9 @@ class WebEnv(BaseEnv):
                 return False, "Failed: `goto_url` requires a non-empty `url`."
 
             await self.page.goto(url, timeout=self.timeout)
+            if _FAST_STEP:
+                await self._settle_until_ready(may_navigate=False)
+                return True, f"Succeed: `goto_url` navigated to {url}."
             try:
                 await self.page.wait_for_load_state("domcontentloaded", timeout=self.timeout)
             except Exception:
@@ -1462,9 +1651,17 @@ class WebEnv(BaseEnv):
             "tool_responses": [],
         }
 
+        # Wall-clock per phase, read by generate_browser for rollout/ metrics.
+        timings = {"a11y": 0.0, "action": 0.0, "screenshot": 0.0, "tabs": 0.0}
+        self.last_step_timings = timings
         try:
-            pre_a11ytree = await self.get_a11ytree()
+            t0 = time.monotonic()
+            # The a11y walk is quadratic in DOM size and its only consumer is the
+            # env_message diff, which nothing reads; the fast path skips it.
+            pre_a11ytree = [] if _FAST_STEP else await self.get_a11ytree()
+            timings["a11y"] += time.monotonic() - t0
 
+            t0 = time.monotonic()
             for action in action_list:
                 flag, msg = await self.execute_single_action(action)
                 info["tool_responses"].append({
@@ -1472,22 +1669,56 @@ class WebEnv(BaseEnv):
                     "tool_response": msg
                 })
                 terminated = True if (action["name"] == "done" and flag) else False
-            
-            post_a11ytree = await self.get_a11ytree()
-            dom_diff = self._diff_a11ytree(pre_a11ytree, post_a11ytree)
-            if dom_diff:
-                info["env_message"] += " " + dom_diff
+            timings["action"] += time.monotonic() - t0
 
-            # Get new observation
+            if _FAST_STEP:
+                # CDP pipelines these; one round trip instead of three.
+                t0 = time.monotonic()
+                screenshot, all_tab_url = await asyncio.gather(self.get_screenshot(), self.get_all_tab_urls())
+                timings["screenshot"] += time.monotonic() - t0
+                post_a11ytree = []
+                rep = getattr(self, "last_settle_report", None) or {}
+                timings["settle"] = float(rep.get("ms", 0)) / 1000.0
+                if _DUMP_SHOTS_DIR:
+                    try:
+                        import json as _json
+                        tag = str(getattr(self, "session_id", None) or id(self))[:12]
+                        n = len(self.action_history)
+                        d = os.path.join(_DUMP_SHOTS_DIR, tag)
+                        os.makedirs(d, exist_ok=True)
+                        ext = "jpg" if _FAST_SCREENSHOT_FORMAT == "jpeg" else "png"
+                        with open(os.path.join(d, f"step{n:03d}.{ext}"), "wb") as fh:
+                            fh.write(screenshot)
+                        with open(os.path.join(d, f"step{n:03d}.json"), "w") as fh:
+                            _json.dump({"url": self.page.url, "actions": [a.get("name") for a in action_list],
+                                        "settle": rep, "timings": timings}, fh)
+                    except Exception as exc:
+                        logger.warning("screenshot dump failed: %s", exc)
+            else:
+                t0 = time.monotonic()
+                post_a11ytree = await self.get_a11ytree()
+                dom_diff = self._diff_a11ytree(pre_a11ytree, post_a11ytree)
+                timings["a11y"] += time.monotonic() - t0
+                if dom_diff:
+                    info["env_message"] += " " + dom_diff
+
+                # Get new observation
+                t0 = time.monotonic()
+                screenshot = await self.get_screenshot()
+                timings["screenshot"] += time.monotonic() - t0
+                t0 = time.monotonic()
+                all_tab_url = await self.get_all_tab_urls()
             observation = {
-                "screenshot": await self.get_screenshot(),
+                "screenshot": screenshot,
                 "a11ytree": post_a11ytree,
                 "screen_size": await self.get_screen_size(), # width, height
-                "all_tab_url": await self.get_all_tab_urls(),
+                "all_tab_url": all_tab_url,
                 "active_tab_url": await self.get_active_tab_url(),
             }
-                        
+            if not _FAST_STEP:
+                timings["tabs"] += time.monotonic() - t0
+
         except Exception as e:
             info["env_message"] = f"Error during env.step(): {str(e)}"
-        
+
         return observation, reward, terminated, truncated, info
